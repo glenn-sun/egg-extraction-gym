@@ -11,6 +11,7 @@ pub mod global_greedy_dag;
 pub mod greedy_dag;
 #[cfg(feature = "ilp-cbc")]
 pub mod ilp_cbc;
+pub mod treewidth;
 
 pub trait Extractor: Sync {
     fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult;

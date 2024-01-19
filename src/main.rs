@@ -36,6 +36,7 @@ fn main() {
             "global-greedy-dag",
             extract::global_greedy_dag::GlobalGreedyDagExtractor.boxed(),
         ),
+        ("treewidth", extract::treewidth::TreewidthExtractor.boxed()),
         #[cfg(feature = "ilp-cbc")]
         (
             "ilp-cbc-timeout",
