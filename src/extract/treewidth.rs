@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use arboretum_td::graph::{HashMapGraph, MutableGraph};
+use arboretum_td::graph::{HashMapGraph, MutableGraph, BaseGraph};
 use arboretum_td::solver::Solver;
 use arboretum_td::tree_decomposition::TreeDecomposition;
 
@@ -135,14 +135,16 @@ struct Env<'a> {
     id_converter: IdConverter,
     circuit: Circuit,
     egraph: &'a EGraph,
+    root_id: usize,
 }
 
 impl<'a> Env<'a> {
-    fn new(id_converter: IdConverter, circuit: Circuit, egraph: &'a EGraph) -> Self {
+    fn new(id_converter: IdConverter, circuit: Circuit, egraph: &'a EGraph, root_id: usize) -> Self {
         Env {
             id_converter,
             circuit,
             egraph,
+            root_id,
         }
     }
 }
@@ -254,6 +256,11 @@ struct ExtendAssigns(FxHashMap<Assignment, Assignment>);
 
 impl ExtendAssigns {
     fn add_if_better(&mut self, env: &Env, bag_assign: Assignment, full_assign: Assignment) {
+        if let Some(root_value) = full_assign.0.get(&env.root_id) {
+            if root_value == &AssignValue::False {
+                return
+            }
+        }
         let cost = full_assign.cost(env);
         if cost.is_finite() {
             if let Some(self_full_assign) = self.0.get(&bag_assign) {
@@ -273,20 +280,23 @@ impl ExtendAssigns {
 trait NiceBag: std::fmt::Debug {
     fn get_assignments(&self, env: &Env) -> ExtendAssigns;
     fn vertices(&self) -> &FxHashSet<usize>;
-    fn current_size(&self) -> usize;
+    fn n_bags(&self) -> usize;
+    fn avg_bag_size(&self) -> f32;
 }
 
 #[derive(Debug)]
 struct Leaf {
     vertices: FxHashSet<usize>,
-    current_size: usize,
+    n_bags: usize,
+    avg_bag_size: f32,
 }
 
 impl Leaf {
     fn new() -> Self {
         Leaf {
             vertices: FxHashSet::default(),
-            current_size: 1,
+            n_bags: 1,
+            avg_bag_size: 0.0,
         }
     }
 }
@@ -302,8 +312,12 @@ impl NiceBag for Leaf {
         &self.vertices
     }
 
-    fn current_size(&self) -> usize {
-        self.current_size
+    fn n_bags(&self) -> usize {
+        self.n_bags
+    }
+
+    fn avg_bag_size(&self) -> f32 {
+        self.avg_bag_size
     }
 }
 
@@ -312,17 +326,21 @@ struct Insert {
     vertices: FxHashSet<usize>,
     child: Box<dyn NiceBag>,
     x: usize,
-    current_size: usize,
+    n_bags: usize,
+    avg_bag_size: f32,
 }
 
 impl Insert {
     fn new(vertices: FxHashSet<usize>, child: Box<dyn NiceBag>, x: usize) -> Self {
-        let size = child.current_size();
+        let child_n_bags = child.n_bags();
+        let child_bag_size = child.avg_bag_size();
+        let size = vertices.len();
         Insert {
             vertices,
             child,
             x,
-            current_size: size + 1,
+            n_bags: child_n_bags + 1,
+            avg_bag_size: (child_n_bags as f32 * child_bag_size + size as f32) / (child_n_bags + 1) as f32
         }
     }
 }
@@ -512,8 +530,12 @@ impl NiceBag for Insert {
         &self.vertices
     }
 
-    fn current_size(&self) -> usize {
-        self.current_size
+    fn n_bags(&self) -> usize {
+        self.n_bags
+    }
+
+    fn avg_bag_size(&self) -> f32 {
+        self.avg_bag_size
     }
 }
 
@@ -522,17 +544,21 @@ struct Forget {
     vertices: FxHashSet<usize>,
     child: Box<dyn NiceBag>,
     x: usize,
-    current_size: usize,
+    n_bags: usize,
+    avg_bag_size: f32,
 }
 
 impl Forget {
     fn new(vertices: FxHashSet<usize>, child: Box<dyn NiceBag>, x: usize) -> Self {
-        let size = child.current_size();
+        let child_n_bags = child.n_bags();
+        let child_bag_size = child.avg_bag_size();
+        let size = vertices.len();
         Forget {
             vertices,
             child,
             x,
-            current_size: size + 1,
+            n_bags: child_n_bags + 1,
+            avg_bag_size: (child_n_bags as f32 * child_bag_size + size as f32) / (child_n_bags + 1) as f32
         }
     }
 }
@@ -553,8 +579,12 @@ impl NiceBag for Forget {
         &self.vertices
     }
 
-    fn current_size(&self) -> usize {
-        self.current_size
+    fn n_bags(&self) -> usize {
+        self.n_bags
+    }
+
+    fn avg_bag_size(&self) -> f32 {
+        self.avg_bag_size
     }
 }
 
@@ -563,18 +593,23 @@ struct Join {
     vertices: FxHashSet<usize>,
     child1: Box<dyn NiceBag>,
     child2: Box<dyn NiceBag>,
-    current_size: usize,
+    n_bags: usize,
+    avg_bag_size: f32,
 }
 
 impl Join {
     fn new(vertices: FxHashSet<usize>, child1: Box<dyn NiceBag>, child2: Box<dyn NiceBag>) -> Self {
-        let size1 = child1.current_size();
-        let size2 = child2.current_size();
+        let child1_n_bags = child1.n_bags();
+        let child2_n_bags = child2.n_bags();
+        let child1_bag_size = child1.avg_bag_size();
+        let child2_bag_size = child2.avg_bag_size();
+        let size = vertices.len();
         Join {
             vertices,
             child1,
             child2,
-            current_size: size1 + size2 + 1,
+            n_bags: child1_n_bags + child2_n_bags + 1,
+            avg_bag_size: (child1_n_bags as f32 * child1_bag_size + child2_n_bags as f32 * child2_bag_size + size as f32) / (child1_n_bags + child2_n_bags + 1) as f32
         }
     }
 }
@@ -639,6 +674,7 @@ impl NiceBag for Join {
                                             }
                                             if all_inputs_true {
                                                 valid = false;
+                                                break;
                                             } else {
                                                 new_bag_assign
                                                     .0
@@ -651,6 +687,7 @@ impl NiceBag for Join {
                         }
                         _ => {
                             valid = false;
+                            break;
                         }
                     }
                 }
@@ -683,8 +720,12 @@ impl NiceBag for Join {
         &self.vertices
     }
 
-    fn current_size(&self) -> usize {
-        self.current_size
+    fn n_bags(&self) -> usize {
+        self.n_bags
+    }
+
+    fn avg_bag_size(&self) -> f32 {
+        self.avg_bag_size
     }
 }
 
@@ -762,6 +803,8 @@ fn forget_until_root(nice_td: Box<dyn NiceBag>, root_id: &usize) -> Box<dyn Nice
 
 impl Extractor for TreewidthExtractor {
     fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult {
+        let start_time = std::time::Instant::now();
+
         // Make ClassIds and NodeIds compatible with arboretum_td
         let mut id_converter = IdConverter::new();
         for (cid, class) in egraph.classes() {
@@ -823,8 +866,18 @@ impl Extractor for TreewidthExtractor {
             }
         }
 
+        let num_verts = graph.order();
+        let num_edges = graph.vertices().map(|v| graph.degree(v) as f32).sum::<f32>() / num_verts as f32 / 2.0;
+        println!("|V|, |E| = {}, {}", num_verts, num_edges);
+
+        println!("preprocessing: {} us", start_time.elapsed().as_micros());
+        let start_time = std::time::Instant::now();
+
         // Run tree decomposition and identify a bag with the root
         let td = Solver::default_exact().solve(&graph);
+
+        println!("td: {} us", start_time.elapsed().as_micros());
+        let start_time = std::time::Instant::now();
 
         let mut root_bag_id: usize = 0;
         for bag in td.bags() {
@@ -835,7 +888,15 @@ impl Extractor for TreewidthExtractor {
         }
 
         let nice_td = forget_until_root(to_nice_decomp(&td, &root_bag_id, None), &root_id);
-        let env = Env::new(id_converter, circuit, egraph);
+
+        println!("number of bags: {}", nice_td.n_bags());
+        println!("average bag size: {}", nice_td.avg_bag_size());
+        println!("max bag size: {}", td.max_bag_size);
+
+        println!("nice td: {} us", start_time.elapsed().as_micros());
+        let start_time = std::time::Instant::now();
+
+        let env = Env::new(id_converter, circuit, egraph, root_id);
         let ea = nice_td.get_assignments(&env);
         let mut root_assign = Assignment::default();
         root_assign.0.insert(root_id, AssignValue::KnownTrue);
@@ -850,6 +911,8 @@ impl Extractor for TreewidthExtractor {
                 }
             }
         }
+
+        println!("extract: {} us", start_time.elapsed().as_micros());
 
         result
     }
