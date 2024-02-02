@@ -219,19 +219,15 @@ impl Assignment {
     }
 
     fn get_true_vertices(assignment: &BTreeMap<usize, AssignValue>) -> FxHashSet<usize> {
-        FxHashSet::from_iter(
-            assignment
-                .iter()
-                .filter_map(|(u, value)| match value.to_bool() {
-                    true => Some(*u),
-                    false => None,
-                }),
-        )
+        assignment.iter().filter_map(|(u, value)| 
+        match value.to_bool() {
+                true => Some(*u),
+                false => None,
+            }
+        ).collect()
     }
 
-    fn exists_cycle(assignment: &BTreeMap<usize, AssignValue>, env: &Env) -> bool {
-        let true_vertices: FxHashSet<usize> = Assignment::get_true_vertices(assignment);
-
+    fn exists_cycle(true_vertices: &FxHashSet<usize>, env: &Env) -> bool {
         let mut exists_cycle = false;
         let mut current_path: FxHashSet<usize> = FxHashSet::default();
         let mut visited: FxHashSet<usize> = FxHashSet::default();
@@ -278,6 +274,17 @@ impl Assignment {
         exists_cycle
     }
 
+    fn is_deterministic(true_vertices: &FxHashSet<usize>, env: &Env) -> bool {
+        for u in true_vertices {
+            if env.circuit.gate_type(u) == Some(&Gate::Or) {
+                if env.circuit.inputs(u).cloned().unwrap_or_default().intersection(true_vertices).count() >= 2 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn cost(assignment: &BTreeMap<usize, AssignValue>, env: &Env) -> Cost {
         // The current implementation uses DAG cost as the cost function.
         // If the assignment contains a cycle, set the cost to infinity.
@@ -285,7 +292,13 @@ impl Assignment {
         // defined on all subgraphs of e-graphs (including cyclic graphs and
         // disconnected graphs), monotone, and preserve order under common
         // unions.
-        if Assignment::exists_cycle(assignment, env) {
+        let true_vertices = Assignment::get_true_vertices(assignment);
+
+        if !Assignment::is_deterministic(&true_vertices, env) {
+            return Cost::new(f64::INFINITY).unwrap();
+        }
+
+        if Assignment::exists_cycle(&true_vertices, env) {
             return Cost::new(f64::INFINITY).unwrap();
         }
 
