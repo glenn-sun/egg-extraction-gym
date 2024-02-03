@@ -4,13 +4,14 @@ use super::*;
 use arboretum_td::graph::{HashMapGraph, MutableGraph};
 use arboretum_td::solver::Solver;
 use arboretum_td::tree_decomposition::TreeDecomposition;
+use nohash_hasher::{IntMap, IntSet};
 
 pub struct Treewidth2Extractor;
 
 #[derive(Debug, Default)]
 struct IdConverter {
-    oid_to_cid: FxHashMap<usize, ClassId>,
-    aid_to_nid: FxHashMap<usize, NodeId>,
+    oid_to_cid: IntMap<usize, ClassId>,
+    aid_to_nid: IntMap<usize, NodeId>,
     cid_to_oid: FxHashMap<ClassId, usize>,
     nid_to_aid: FxHashMap<NodeId, usize>,
     counter: usize,
@@ -61,18 +62,18 @@ impl IdConverter {
 
 #[derive(Debug)]
 struct DirectedGraph {
-    vertices: FxHashSet<usize>,
-    inputs: FxHashMap<usize, FxHashSet<usize>>,
-    outputs: FxHashMap<usize, FxHashSet<usize>>,
+    vertices: IntSet<usize>,
+    inputs: IntMap<usize, IntSet<usize>>,
+    outputs: IntMap<usize, IntSet<usize>>,
     root_id: usize,
 }
 
 impl DirectedGraph {
     fn new(root_id: usize) -> Self {
         DirectedGraph {
-            vertices: FxHashSet::default(),
-            inputs: FxHashMap::default(),
-            outputs: FxHashMap::default(),
+            vertices: IntSet::default(),
+            inputs: IntMap::default(),
+            outputs: IntMap::default(),
             root_id,
         }
     }
@@ -105,13 +106,13 @@ impl DirectedGraph {
         self.outputs.entry(u).or_default().remove(&v);
     }
 
-    fn get_vertices(&self) -> &FxHashSet<usize> {
+    fn get_vertices(&self) -> &IntSet<usize> {
         &self.vertices
     }
-    fn inputs(&self, u: &usize) -> Option<&FxHashSet<usize>> {
+    fn inputs(&self, u: &usize) -> Option<&IntSet<usize>> {
         self.inputs.get(u)
     }
-    fn outputs(&self, u: &usize) -> Option<&FxHashSet<usize>> {
+    fn outputs(&self, u: &usize) -> Option<&IntSet<usize>> {
         self.outputs.get(u)
     }
 
@@ -130,13 +131,13 @@ impl DirectedGraph {
 struct Env<'a> {
     id_converter: IdConverter,
     digraph: DirectedGraph,
-    nodes_in_class: FxHashMap<usize, FxHashSet<usize>>,
-    classes_in_node: FxHashMap<usize, FxHashSet<usize>>,
+    nodes_in_class: IntMap<usize, IntSet<usize>>,
+    classes_in_node: IntMap<usize, IntSet<usize>>,
     egraph: &'a EGraph,
 }
 
 impl<'a> Env<'a> {
-    fn new(id_converter: IdConverter, digraph: DirectedGraph, nodes_in_class: FxHashMap<usize, FxHashSet<usize>>, classes_in_node: FxHashMap<usize, FxHashSet<usize>>, egraph: &'a EGraph) -> Self {
+    fn new(id_converter: IdConverter, digraph: DirectedGraph, nodes_in_class: IntMap<usize, IntSet<usize>>, classes_in_node: IntMap<usize, IntSet<usize>>, egraph: &'a EGraph) -> Self {
         Env {
             id_converter,
             digraph,
@@ -196,61 +197,53 @@ enum Action {
     Forget,
 }
 
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum DFSStatus {
+    Unvisited,
+    CurrentPath,
+    Visited
+}
+
 impl Assignment {
     fn new(assignment: BTreeMap<usize, AssignValue>) -> Self {
         Assignment { assignment }
     }
 
-    fn get_true_aids(assignment: &BTreeMap<usize, AssignValue>) -> FxHashSet<usize> {
-        assignment.values().filter_map(|value| value.to_aid()).collect()
-    }
-
     fn exists_cycle(assignment: &BTreeMap<usize, AssignValue>, env: &Env) -> bool {
         let mut exists_cycle = false;
-        let mut current_path: FxHashSet<usize> = FxHashSet::default();
-        let mut visited: FxHashSet<usize> = FxHashSet::default();
+        let mut status: IntMap<usize, DFSStatus> = IntMap::default();
+        let mut call_stack: Vec<usize> = Vec::default();        
 
-        let mut call_stack: Vec<(usize, Action)> = Vec::default();
-        let true_oids: FxHashSet<usize> = assignment.iter().filter_map(|(u, value)| value.class_to_bool().then_some(*u)).collect();
-        
-        // println!("{:#?}", true_oids);
-
-        for u in true_oids.iter() {
-            call_stack.push((*u, Action::Forget));
-            call_stack.push((*u, Action::Insert));
+        for u in assignment.iter().filter_map(|(u, value)| value.class_to_bool().then_some(*u)) {
+            status.insert(u, DFSStatus::Unvisited);
+            call_stack.push(u);
         }
 
-        while let Some((u, a)) = call_stack.pop() {
-            // println!("{:?}", call_stack);
-            // println!("{:?}", current_path);
-            // println!("{:?}", visited);
-
-
-            match a {
-                Action::Forget => {
-                    current_path.remove(&u);
+        while let Some(u) = call_stack.pop() {
+            match status.get(&u) {
+                Some(&DFSStatus::Visited) => {}
+                Some(&DFSStatus::CurrentPath) => {
+                    status.insert(u, DFSStatus::Visited);
                 }
-                Action::Insert => {
-                    if visited.contains(&u) {
-                        continue;
-                    }
-                    current_path.insert(u);
-                    visited.insert(u);
+                Some(&DFSStatus::Unvisited) => {
+                    status.insert(u, DFSStatus::CurrentPath);
                     for v in env.digraph.outputs(&u).unwrap() {
-                        // println!("{:?}", v);
-
-                        if true_oids.contains(v) {
-                            if current_path.contains(v) {
+                        match status.get(v) {
+                            Some(&DFSStatus::CurrentPath) => {
                                 exists_cycle = true;
                                 break;
                             }
-                            if !visited.contains(v) {
-                                call_stack.push((*v, Action::Forget));
-                                call_stack.push((*v, Action::Insert));
+
+                            Some(&DFSStatus::Unvisited) => {
+                                call_stack.push(*v);
+                                call_stack.push(*v);
                             }
+
+                            _ => {}
                         }
                     }
                 }
+                None => unreachable!()
             }
         }
 
@@ -269,7 +262,7 @@ impl Assignment {
         }
 
         let mut sum = Cost::default();
-        for u in Assignment::get_true_aids(assignment) {
+        for u in assignment.values().filter_map(|value| value.to_aid()) {
             if let Some(nid) = env.id_converter.aid_to_nid(&u) {
                 sum += env.egraph.nodes.get(nid).unwrap().cost;
             }
@@ -304,24 +297,24 @@ impl ExtendAssigns {
 #[derive(Debug)]
 enum NiceBag {
     Leaf {
-        vertices: FxHashSet<usize>,
+        vertices: IntSet<usize>,
     },
     Insert {
-        vertices: FxHashSet<usize>,
+        vertices: IntSet<usize>,
         child: Box<NiceBag>,
         x: usize,
         n_bags: usize,
         avg_bag_size: f32,
     },
     Forget {
-        vertices: FxHashSet<usize>,
+        vertices: IntSet<usize>,
         child: Box<NiceBag>,
         x: usize,
         n_bags: usize,
         avg_bag_size: f32,
     },
     Join {
-        vertices: FxHashSet<usize>,
+        vertices: IntSet<usize>,
         child1: Box<NiceBag>,
         child2: Box<NiceBag>,
         n_bags: usize,
@@ -478,7 +471,7 @@ impl NiceBag {
             }
         }
     }
-    fn vertices(&self) -> &FxHashSet<usize> {
+    fn vertices(&self) -> &IntSet<usize> {
         match self {
             NiceBag::Leaf { vertices } => vertices,
             NiceBag::Insert { vertices, child: _, x: _, n_bags: _, avg_bag_size: _ } => vertices,
@@ -506,10 +499,10 @@ impl NiceBag {
     }
 
     fn new_leaf() -> Self {
-        NiceBag::Leaf { vertices: FxHashSet::default() }
+        NiceBag::Leaf { vertices: IntSet::default() }
     }
 
-    fn new_insert(vertices: FxHashSet<usize>, child: Box<NiceBag>, x: usize) -> NiceBag {
+    fn new_insert(vertices: IntSet<usize>, child: Box<NiceBag>, x: usize) -> NiceBag {
         let child_n_bags = child.n_bags();
         let child_bag_size = child.avg_bag_size();
         let size = vertices.len();
@@ -523,7 +516,7 @@ impl NiceBag {
         }
     }
 
-    fn new_forget(vertices: FxHashSet<usize>, child: Box<NiceBag>, x: usize) -> NiceBag {
+    fn new_forget(vertices: IntSet<usize>, child: Box<NiceBag>, x: usize) -> NiceBag {
         let child_n_bags = child.n_bags();
         let child_bag_size = child.avg_bag_size();
         let size = vertices.len();
@@ -537,7 +530,7 @@ impl NiceBag {
         }
     }
 
-    fn new_join(vertices: FxHashSet<usize>, child1: Box<NiceBag>, child2: Box<NiceBag>) -> NiceBag {
+    fn new_join(vertices: IntSet<usize>, child1: Box<NiceBag>, child2: Box<NiceBag>) -> NiceBag {
         let child1_n_bags = child1.n_bags();
         let child2_n_bags = child2.n_bags();
         let child1_bag_size = child1.avg_bag_size();
@@ -645,7 +638,7 @@ fn to_nice_decomp(
     parent_id.map(|u| child_ids.remove(&u));
     if child_ids.is_empty() {
         let mut prev = Box::new(NiceBag::new_leaf());
-        let mut vertices: FxHashSet<usize> = FxHashSet::default();
+        let mut vertices: IntSet<usize> = IntSet::default();
         for u in root_bag.vertex_set.iter() {
             vertices.insert(*u);
             let next = NiceBag::new_insert(vertices.clone(), prev, *u);
@@ -664,7 +657,7 @@ fn to_nice_decomp(
         let mut vertices = prev.vertices().clone();
         let vertices_clone = vertices.clone();
 
-        let root_vertices = FxHashSet::from_iter(root_bag.vertex_set.clone().into_iter());
+        let root_vertices = IntSet::from_iter(root_bag.vertex_set.clone().into_iter());
         let root_not_child = root_vertices.difference(&vertices_clone);
         let child_not_root = vertices_clone.difference(&root_vertices);
 
@@ -744,7 +737,7 @@ impl<'a> Env<'a> {
             if options.remove_unreachable {
                 let mut call_stack: Vec<usize> = Vec::default();
                 call_stack.push(self.digraph.root_id);
-                let mut visited: FxHashSet<usize> = FxHashSet::default();
+                let mut visited: IntSet<usize> = IntSet::default();
     
                 while let Some(u) = call_stack.pop() {
                     if visited.contains(&u) {
@@ -799,8 +792,8 @@ impl Extractor for Treewidth2Extractor {
         let start_time = std::time::Instant::now();
 
         let mut id_converter = IdConverter::default();
-        let mut nodes_in_class: FxHashMap<usize, FxHashSet<usize>> = FxHashMap::default();
-        let mut classes_in_node: FxHashMap<usize, FxHashSet<usize>> = FxHashMap::default();
+        let mut nodes_in_class: IntMap<usize, IntSet<usize>> = IntMap::default();
+        let mut classes_in_node: IntMap<usize, IntSet<usize>> = IntMap::default();
 
         let root_oid = id_converter.reserve_id();
         let root_aid = id_converter.reserve_id();
