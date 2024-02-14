@@ -219,12 +219,13 @@ impl Assignment {
     }
 
     fn get_true_vertices(assignment: &BTreeMap<usize, AssignValue>) -> FxHashSet<usize> {
-        assignment.iter().filter_map(|(u, value)| 
-        match value.to_bool() {
+        assignment
+            .iter()
+            .filter_map(|(u, value)| match value.to_bool() {
                 true => Some(*u),
                 false => None,
-            }
-        ).collect()
+            })
+            .collect()
     }
 
     fn exists_cycle(true_vertices: &FxHashSet<usize>, env: &Env) -> bool {
@@ -277,7 +278,15 @@ impl Assignment {
     fn is_deterministic(true_vertices: &FxHashSet<usize>, env: &Env) -> bool {
         for u in true_vertices {
             if env.circuit.gate_type(u) == Some(&Gate::Or) {
-                if env.circuit.inputs(u).cloned().unwrap_or_default().intersection(true_vertices).count() >= 2 {
+                if env
+                    .circuit
+                    .inputs(u)
+                    .cloned()
+                    .unwrap_or_default()
+                    .intersection(true_vertices)
+                    .count()
+                    >= 2
+                {
                     return false;
                 }
             }
@@ -440,7 +449,7 @@ impl AssignValueIndicator {
     }
 
     // When inserting x, if some outputs/inputs of x are already assigned,
-    // this restricts the values we are allowed to assign x by gate rules. 
+    // this restricts the values we are allowed to assign x by gate rules.
     fn restrict_by_outputs(
         &mut self,
         env: &Env,
@@ -575,7 +584,7 @@ impl Default for AssignValueIndicator {
 
 impl NiceBag for Insert {
     // For an insert node, add all possible assignments to the new vertex, and upgrade
-    // any SupposedTrue outputs 
+    // any SupposedTrue outputs
     fn get_assignments<'a>(&self, env: &Env) -> ExtendAssigns {
         let mut ea = ExtendAssigns::default();
         let child_assignments = self.child.get_assignments(env).0;

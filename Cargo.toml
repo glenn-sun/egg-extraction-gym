@@ -22,6 +22,12 @@ rustc-hash = "1.1.0"
 
 rpds = "1.1.0"
 arboretum-td = "0.1.0"
+nohash-hasher = "0.2.0"
+rand = "0.8.5"
+tokio = { version = "1.36.0", features = ["time", "rt", "full"] }
 [dependencies.egraph-serialize]
 git = "https://github.com/egraphs-good/egraph-serialize"
 rev = "951b829a434f4008c7b45ba4ac0da1037d2da90"
+
+[profile.release]
+debug = 1
