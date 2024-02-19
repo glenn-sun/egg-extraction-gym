@@ -1,9 +1,11 @@
-use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher, BuildHasherDefault};
 
 use super::*;
-use arboretum_td::graph::{BaseGraph, HashMapGraph, MutableGraph};
+use arboretum_td::graph::{HashMapGraph, MutableGraph};
 use arboretum_td::solver::Solver;
 use arboretum_td::tree_decomposition::TreeDecomposition;
+
+use nohash_hasher::{IntMap, IntSet, NoHashHasher};
 
 pub struct TreewidthExtractor;
 
@@ -11,11 +13,11 @@ pub struct TreewidthExtractor;
 /// IDs for use with arboretum_td are required to be usize.
 /// For convenience, this maintains maps in both directions
 /// and segregates IDs for Variables, And gates, and Or gates.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct IdConverter {
-    oid_to_cid: FxHashMap<usize, ClassId>,
-    aid_to_nid: FxHashMap<usize, NodeId>,
-    vid_to_nid: FxHashMap<usize, NodeId>,
+    oid_to_cid: IntMap<usize, ClassId>,
+    aid_to_nid: IntMap<usize, NodeId>,
+    vid_to_nid: IntMap<usize, NodeId>,
     cid_to_oid: FxHashMap<ClassId, usize>,
     nid_to_aid: FxHashMap<NodeId, usize>,
     nid_to_vid: FxHashMap<NodeId, usize>,
@@ -23,32 +25,37 @@ struct IdConverter {
 }
 
 impl IdConverter {
-    fn new() -> Self {
-        IdConverter {
-            oid_to_cid: FxHashMap::default(),
-            aid_to_nid: FxHashMap::default(),
-            vid_to_nid: FxHashMap::default(),
-            cid_to_oid: FxHashMap::default(),
-            nid_to_aid: FxHashMap::default(),
-            nid_to_vid: FxHashMap::default(),
-            counter: 0,
+    fn get_oid_or_add_class(&mut self, cid: &ClassId) -> usize {
+        if let Some(oid) = self.cid_to_oid.get(cid) {
+            *oid
+        } else {
+            self.oid_to_cid.insert(self.counter, cid.clone());
+            self.cid_to_oid.insert(cid.clone(), self.counter);
+            self.counter += 1;
+            self.counter - 1
         }
     }
 
-    fn add_class(&mut self, cid: ClassId) {
-        self.oid_to_cid.insert(self.counter, cid.clone());
-        self.cid_to_oid.insert(cid, self.counter);
-        self.counter += 1;
+    fn get_aid_or_add_node(&mut self, nid: &NodeId) -> usize {
+        if let Some(aid) = self.nid_to_aid.get(&nid) {
+            *aid
+        } else {
+            self.aid_to_nid.insert(self.counter, nid.clone());
+            self.nid_to_aid.insert(nid.clone(), self.counter);
+            self.counter += 1;
+            self.counter - 1
+        }
     }
 
-    fn add_node(&mut self, nid: NodeId) {
-        self.aid_to_nid.insert(self.counter, nid.clone());
-        self.nid_to_aid.insert(nid.clone(), self.counter);
-        self.counter += 1;
-
-        self.vid_to_nid.insert(self.counter, nid.clone());
-        self.nid_to_vid.insert(nid, self.counter);
-        self.counter += 1;
+    fn get_vid_or_add_node(&mut self, nid: &NodeId) -> usize {
+        if let Some(vid) = self.nid_to_vid.get(&nid) {
+            *vid
+        } else {
+            self.vid_to_nid.insert(self.counter, nid.clone());
+            self.nid_to_vid.insert(nid.clone(), self.counter);
+            self.counter += 1;
+            self.counter - 1
+        }
     }
 
     /// Reserve an ID that does not correspond to any e-class or e-node.
@@ -57,23 +64,11 @@ impl IdConverter {
         self.counter - 1
     }
 
-    fn oid_to_cid(&self, oid: &usize) -> Option<&ClassId> {
-        self.oid_to_cid.get(oid)
-    }
-    fn aid_to_nid(&self, aid: &usize) -> Option<&NodeId> {
-        self.aid_to_nid.get(aid)
-    }
     fn vid_to_nid(&self, vid: &usize) -> Option<&NodeId> {
         self.vid_to_nid.get(vid)
     }
-    fn cid_to_oid(&self, cid: &ClassId) -> Option<&usize> {
-        self.cid_to_oid.get(cid)
-    }
-    fn nid_to_aid(&self, nid: &NodeId) -> Option<&usize> {
-        self.nid_to_aid.get(nid)
-    }
-    fn nid_to_vid(&self, nid: &NodeId) -> Option<&usize> {
-        self.nid_to_vid.get(nid)
+    fn vid_to_nid_or_unreachable(&self, vid: &usize) -> &NodeId {
+        self.vid_to_nid.get(vid).unwrap_or_else(|| unreachable!())
     }
 }
 
@@ -90,20 +85,20 @@ enum Gate {
 /// tree decomposition.
 #[derive(Debug)]
 struct Circuit {
-    vertices: FxHashSet<usize>,
-    inputs: FxHashMap<usize, FxHashSet<usize>>,
-    outputs: FxHashMap<usize, FxHashSet<usize>>,
-    gate_type: FxHashMap<usize, Gate>,
+    vertices: IntSet<usize>,
+    inputs: IntMap<usize, IntSet<usize>>,
+    outputs: IntMap<usize, IntSet<usize>>,
+    gate_type: IntMap<usize, Gate>,
     root_id: usize,
 }
 
 impl Circuit {
     fn new(root_id: usize) -> Self {
         Circuit {
-            vertices: FxHashSet::default(),
-            inputs: FxHashMap::default(),
-            outputs: FxHashMap::default(),
-            gate_type: FxHashMap::default(),
+            vertices: IntSet::default(),
+            inputs: IntMap::default(),
+            outputs: IntMap::default(),
+            gate_type: IntMap::default(),
             root_id,
         }
     }
@@ -111,6 +106,8 @@ impl Circuit {
     fn add_vertex(&mut self, u: usize, gate_type: Gate) {
         self.vertices.insert(u);
         self.gate_type.insert(u, gate_type);
+        self.inputs.entry(u).or_default();
+        self.outputs.entry(u).or_default();
     }
 
     fn add_edge(&mut self, u: usize, v: usize) {
@@ -153,17 +150,39 @@ impl Circuit {
         self.vertices.remove(&v);
     }
 
-    fn get_vertices(&self) -> &FxHashSet<usize> {
+    fn get_vertices(&self) -> &IntSet<usize> {
         &self.vertices
     }
-    fn inputs(&self, u: &usize) -> Option<&FxHashSet<usize>> {
+
+    fn inputs(&self, u: &usize) -> Option<&IntSet<usize>> {
         self.inputs.get(u)
     }
-    fn outputs(&self, u: &usize) -> Option<&FxHashSet<usize>> {
+    fn inputs_or_unreachable(&self, u: &usize) -> &IntSet<usize> {
+        self.inputs.get(u).unwrap_or_else(|| unreachable!())
+    }
+
+    fn outputs(&self, u: &usize) -> Option<&IntSet<usize>> {
         self.outputs.get(u)
     }
+    fn outputs_or_unreachable(&self, u: &usize) -> &IntSet<usize> {
+        self.outputs.get(u).unwrap_or_else(|| unreachable!())
+    }
+
     fn gate_type(&self, u: &usize) -> Option<&Gate> {
         self.gate_type.get(u)
+    }
+    fn gate_type_or_unreachable(&self, u: &usize) -> &Gate {
+        self.gate_type.get(u).unwrap_or_else(|| unreachable!())
+    }
+
+    fn to_graph(&self) -> HashMapGraph {
+        let mut graph = HashMapGraph::new();
+        for u in self.get_vertices() {
+            for v in self.inputs_or_unreachable(u) {
+                graph.add_edge(*u, *v);
+            }
+        }
+        graph
     }
 }
 
@@ -186,7 +205,9 @@ impl<'a> Env<'a> {
 
 // Assignments take values from AssignValue. We distinguish vertices known
 // to be true based on other assignments made so far and vertices that we
-// want to be true.
+// want to be true. It would be sound to also distinguish vertices known to
+// be false and vertices that we want to be false, but the distinction
+// turns out to be unnecessary (see other comments for details).
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Debug)]
 enum AssignValue {
     KnownTrue,
@@ -206,124 +227,146 @@ impl AssignValue {
 
 /// A map that represents a valid partial evaluation of a circuit.
 /// Uses BTreeMap so that it can be hashed.
-#[derive(PartialEq, Eq, Hash, Default, Clone, Debug)]
+#[derive(PartialEq, Eq, Default, Clone, Debug)]
 struct Assignment {
-    assignment: BTreeMap<usize, AssignValue>,
-    cost: Cost,
+    map: IntMap<usize, AssignValue>,
+    true_vertices: IntSet<usize>,
+    exists_cycle: Option<bool>,
+    is_deterministic: Option<bool>,
+    cost: Option<Cost>,
+}
+
+impl Hash for Assignment {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        for elt in &self.map {
+            elt.hash(state);
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+enum DFSStatus {
+    Unvisited,
+    CurrentPath,
+    Visited,
 }
 
 impl Assignment {
-    fn new(assignment: BTreeMap<usize, AssignValue>, env: &Env) -> Self {
-        let cost = Assignment::cost(&assignment, env);
-        Assignment { assignment, cost }
-    }
-
-    fn get_true_vertices(assignment: &BTreeMap<usize, AssignValue>) -> FxHashSet<usize> {
-        assignment
-            .iter()
-            .filter_map(|(u, value)| match value.to_bool() {
+    fn from_map(map: IntMap<usize, AssignValue>) -> Self {
+        let true_vertices = map.iter().filter_map(|(u, value)| 
+            match value.to_bool() {
                 true => Some(*u),
                 false => None,
-            })
-            .collect()
+            }
+        ).collect();
+        Assignment { 
+            map, 
+            true_vertices,
+            exists_cycle: None,
+            is_deterministic: None,
+            cost: None 
+        }
     }
 
-    fn exists_cycle(true_vertices: &FxHashSet<usize>, env: &Env) -> bool {
-        let mut exists_cycle = false;
-        let mut current_path: FxHashSet<usize> = FxHashSet::default();
-        let mut visited: FxHashSet<usize> = FxHashSet::default();
-
-        #[derive(PartialEq, Eq, Clone, Copy, Debug)]
-        enum Action {
-            Insert,
-            Forget,
+    fn insert(&mut self, k: usize, v: AssignValue) {
+        if v.to_bool() {
+            self.true_vertices.insert(k);
+            self.exists_cycle = None; //TODO: optimize these
+            self.is_deterministic = None;
+            self.cost = None;
         }
+        self.map.insert(k, v);
+    }
 
-        let mut call_stack: Vec<(usize, Action)> = Vec::default();
-        for u in true_vertices.iter() {
-            call_stack.push((*u, Action::Forget));
-            call_stack.push((*u, Action::Insert));
+    fn remove(&mut self, k: &usize) {
+        if self.true_vertices.contains(k) {
+            self.true_vertices.remove(k);
+            self.exists_cycle = None; //TODO: optimize these
+            self.is_deterministic = None;
+            self.cost = None;
         }
+        self.map.remove(k);
+    }
 
-        while let Some((u, a)) = call_stack.pop() {
-            match a {
-                Action::Forget => {
-                    current_path.remove(&u);
-                }
-                Action::Insert => {
-                    if visited.contains(&u) {
-                        continue;
+    fn exists_cycle(&self, env: &Env) -> bool {
+        if let Some(answer) = self.exists_cycle {
+            return answer;
+        } else {
+            let mut answer = false;
+            let mut status: HashMap<usize, DFSStatus, BuildHasherDefault<NoHashHasher<usize>>> =
+                HashMap::with_capacity_and_hasher(self.map.len(), BuildHasherDefault::default());
+            let mut call_stack: Vec<usize> = Vec::with_capacity(self.map.len() * 4);
+    
+            for u in self.true_vertices.iter() {
+                status.insert(*u, DFSStatus::Unvisited);
+                call_stack.push(*u);
+                call_stack.push(*u);
+            }
+    
+            while let Some(u) = call_stack.pop() {
+                match status.get(&u) {
+                    Some(&DFSStatus::Visited) => {}
+                    Some(&DFSStatus::CurrentPath) => {
+                        status.insert(u, DFSStatus::Visited);
                     }
-                    current_path.insert(u);
-                    visited.insert(u);
-                    for v in env.circuit.outputs(&u).cloned().unwrap_or_default() {
-                        if true_vertices.contains(&v) {
-                            if current_path.contains(&v) {
-                                exists_cycle = true;
-                                break;
-                            }
-                            if !visited.contains(&v) {
-                                call_stack.push((v, Action::Forget));
-                                call_stack.push((v, Action::Insert));
+                    Some(&DFSStatus::Unvisited) => {
+                        status.insert(u, DFSStatus::CurrentPath);
+                        for v in env.circuit.outputs_or_unreachable(&u) {
+                            match status.get(v) {
+                                Some(&DFSStatus::CurrentPath) => {
+                                    answer = true;
+                                    break;
+                                }
+    
+                                Some(&DFSStatus::Unvisited) => {
+                                    call_stack.push(*v);
+                                    call_stack.push(*v);
+                                }
+    
+                                _ => {}
                             }
                         }
                     }
+                    None => unreachable!(),
                 }
             }
+            answer
         }
-
-        exists_cycle
+        
     }
 
-    fn is_deterministic(true_vertices: &FxHashSet<usize>, env: &Env) -> bool {
-        for u in true_vertices {
-            if env.circuit.gate_type(u) == Some(&Gate::Or) {
-                if env
-                    .circuit
-                    .inputs(u)
-                    .cloned()
-                    .unwrap_or_default()
-                    .intersection(true_vertices)
-                    .count()
-                    >= 2
-                {
-                    return false;
+    fn is_deterministic(&self, env: &Env) -> bool {
+        if let Some(answer) = self.is_deterministic {
+            return answer;
+        } else {
+            for u in &self.true_vertices {
+                if env.circuit.gate_type_or_unreachable(u) == &Gate::Or {
+                    if env
+                        .circuit
+                        .inputs_or_unreachable(u)
+                        .intersection(&self.true_vertices)
+                        .count()
+                        >= 2
+                    {
+                        return false;
+                    }
                 }
             }
+            true
         }
-        true
     }
 
-    fn cost(assignment: &BTreeMap<usize, AssignValue>, env: &Env) -> Cost {
-        // The current implementation uses DAG cost as the cost function.
-        // If the assignment contains a cycle, set the cost to infinity.
-        // This can be adapted to other cost functions, but they should be
-        // defined on all subgraphs of e-graphs (including cyclic graphs and
-        // disconnected graphs), monotone, and preserve order under common
-        // unions.
-        let true_vertices = Assignment::get_true_vertices(assignment);
-
-        if !Assignment::is_deterministic(&true_vertices, env) {
-            return Cost::new(f64::INFINITY).unwrap();
+    fn cost(&mut self, env: &Env) -> Cost {
+        if let Some(answer) = self.cost {
+            return answer;
+        } else {
+            let sum = self.true_vertices.iter()
+                .filter(|u| env.circuit.gate_type_or_unreachable(u) == &Gate::Variable)
+                .map(|u| env.egraph.nodes.get(env.id_converter.vid_to_nid_or_unreachable(u)).unwrap().cost)
+                .sum();
+            self.cost = Some(sum);
+            sum
         }
-
-        if Assignment::exists_cycle(&true_vertices, env) {
-            return Cost::new(f64::INFINITY).unwrap();
-        }
-
-        let mut sum = Cost::default();
-        for u in Assignment::get_true_vertices(assignment) {
-            if env.circuit.gate_type(&u) == Some(&Gate::Variable) {
-                if let Some(node) = env
-                    .id_converter
-                    .vid_to_nid(&u)
-                    .and_then(|nid| env.egraph.nodes.get(nid))
-                {
-                    sum += node.cost;
-                }
-            }
-        }
-        sum
     }
 }
 
@@ -337,508 +380,380 @@ impl Assignment {
 struct ExtendAssigns(FxHashMap<Assignment, Assignment>);
 
 impl ExtendAssigns {
-    fn add_if_better(&mut self, env: &Env, bag_assign: Assignment, full_assign: Assignment) {
-        if full_assign.assignment.get(&env.circuit.root_id) == Some(&AssignValue::False) {
+    fn add_if_better(&mut self, env: &Env, bag_assign: Assignment, mut full_assign: Assignment) {
+        if full_assign.map.get(&env.circuit.root_id) == Some(&AssignValue::False) {
             return;
         }
 
-        let cost = full_assign.cost;
-        if cost.is_finite() {
-            if let Some(self_full_assign) = self.0.get(&bag_assign) {
-                if self_full_assign.cost > cost {
-                    self.0.insert(bag_assign, full_assign);
-                }
-            } else {
+        if let Some(self_full_assign) = self.0.get_mut(&bag_assign) {
+            let self_cost = self_full_assign.cost(env);
+            if self_cost > full_assign.cost(env) {
                 self.0.insert(bag_assign, full_assign);
             }
+        } else {
+            self.0.insert(bag_assign, full_assign);
         }
     }
 }
 
-/// A bag for a nice tree decomposition. A nice tree decomposition is one
-/// in which every bag is of the form "empty leaf", "insert u", "forget u",
-/// or "join two identical bags".
-trait NiceBag: std::fmt::Debug {
-    fn get_assignments(&self, env: &Env) -> ExtendAssigns;
-    fn vertices(&self) -> &FxHashSet<usize>;
-    fn n_bags(&self) -> usize;
-    fn avg_bag_size(&self) -> f32;
-}
+// Interpret as False, SupposedTrue, KnownTrue
+struct PossibleValues([bool; 3]);
 
-#[derive(Debug)]
-struct Leaf {
-    vertices: FxHashSet<usize>,
-    n_bags: usize,
-    avg_bag_size: f32,
-}
-
-impl Leaf {
-    fn new() -> Self {
-        Leaf {
-            vertices: FxHashSet::default(),
-            n_bags: 1,
-            avg_bag_size: 0.0,
+impl PossibleValues {
+    fn from_vertex(u: usize, env: &Env) -> Self {
+        match env.circuit.gate_type_or_unreachable(&u) {
+            Gate::And => PossibleValues([true, true, true]),
+            Gate::Or => PossibleValues([true, true, true]),
+            Gate::Variable => PossibleValues([true, false, true]),
         }
-    }
-}
-
-impl NiceBag for Leaf {
-    fn get_assignments(&self, _env: &Env) -> ExtendAssigns {
-        let mut ea = ExtendAssigns::default();
-        ea.0.insert(Assignment::default(), Assignment::default());
-        ea
-    }
-
-    fn vertices(&self) -> &FxHashSet<usize> {
-        &self.vertices
-    }
-
-    fn n_bags(&self) -> usize {
-        self.n_bags
-    }
-
-    fn avg_bag_size(&self) -> f32 {
-        self.avg_bag_size
-    }
-}
-
-#[derive(Debug)]
-struct Insert {
-    vertices: FxHashSet<usize>,
-    child: Box<dyn NiceBag>,
-    x: usize,
-    n_bags: usize,
-    avg_bag_size: f32,
-}
-
-impl Insert {
-    fn new(vertices: FxHashSet<usize>, child: Box<dyn NiceBag>, x: usize) -> Self {
-        let child_n_bags = child.n_bags();
-        let child_bag_size = child.avg_bag_size();
-        let size = vertices.len();
-        Insert {
-            vertices,
-            child,
-            x,
-            n_bags: child_n_bags + 1,
-            avg_bag_size: (child_n_bags as f32 * child_bag_size + size as f32)
-                / (child_n_bags + 1) as f32,
-        }
-    }
-}
-
-struct AssignValueIndicator {
-    pub False: bool,
-    pub KnownTrue: bool,
-    pub SupposedTrue: bool,
-}
-
-impl AssignValueIndicator {
-    fn to_vec(&self) -> Vec<AssignValue> {
-        let mut out: Vec<AssignValue> = Vec::default();
-        if self.False {
-            out.push(AssignValue::False);
-        }
-        if self.KnownTrue {
-            out.push(AssignValue::KnownTrue);
-        }
-        if self.SupposedTrue {
-            out.push(AssignValue::SupposedTrue);
-        }
-        out
     }
 
     // When inserting x, if some outputs/inputs of x are already assigned,
     // this restricts the values we are allowed to assign x by gate rules.
-    fn restrict_by_outputs(
-        &mut self,
-        env: &Env,
-        bag: &Insert,
-        bag_assign: &Assignment,
-        full_assign: &Assignment,
-    ) {
-        let outputs = env.circuit.outputs(&bag.x).cloned().unwrap_or_default();
-        for out in outputs {
-            if !bag.vertices.contains(&out) {
-                continue;
-            }
-            match env.circuit.gate_type(&out) {
-                Some(Gate::Or) => match bag_assign.assignment.get(&out) {
-                    Some(AssignValue::False) => {
-                        self.KnownTrue = false;
-                        self.SupposedTrue = false;
+    fn restrict_by_outputs(&mut self, bag: &NiceBag, bag_assign: &Assignment, full_assign: &Assignment, env: &Env) {
+        match bag {
+            NiceBag::Insert { vertices, child: _, x } => {
+                let outputs = env.circuit.outputs_or_unreachable(x);
+                for out in outputs {
+                    // Outputs to x which have not yet been considered do not
+                    // restrict the possible assignments to x. No outputs to x
+                    // can be already forgotten, because that would violate
+                    // the definition of tree decomposition. Hence, only outputs
+                    // contained in the bag can restrict possible values of x.
+                    if !vertices.contains(&out) {
+                        continue;
                     }
-                    Some(AssignValue::KnownTrue) => {
-                        self.KnownTrue = false;
-                        self.SupposedTrue = false;
-                    }
-                    Some(AssignValue::SupposedTrue) => {
-                        let siblings: FxHashSet<usize> =
-                            env.circuit.inputs(&out).cloned().unwrap_or_default();
-                        let mut set_gates: FxHashSet<usize> =
-                            full_assign.assignment.keys().cloned().collect();
-                        set_gates.insert(bag.x);
-                        if siblings.is_subset(&set_gates) {
-                            self.False = false;
-                        }
-                    }
-                    None => {}
-                },
-                Some(Gate::And) => {
-                    match bag_assign.assignment.get(&out) {
-                        Some(AssignValue::False) => {}
-                        Some(AssignValue::KnownTrue) => {
-                            // case not possible
-                        }
-                        Some(AssignValue::SupposedTrue) => {
-                            self.False = false;
-                        }
-                        None => {}
-                    }
-                }
-                Some(Gate::Variable) => {}
-                None => {}
-            }
-        }
-    }
-
-    fn restrict_by_inputs(
-        &mut self,
-        env: &Env,
-        bag: &Insert,
-        bag_assign: &Assignment,
-        full_assign: &Assignment,
-    ) {
-        match env.circuit.gate_type(&bag.x) {
-            Some(Gate::Variable) => {
-                self.SupposedTrue = false;
-            }
-            Some(Gate::Or) => {
-                let input_colors = FxHashSet::from_iter(
-                    env.circuit
-                        .inputs(&bag.x)
-                        .cloned()
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|input| bag_assign.assignment.get(input)),
-                );
-                if input_colors.contains(&Some(&AssignValue::KnownTrue))
-                    || input_colors.contains(&Some(&AssignValue::SupposedTrue))
-                {
-                    self.False = false;
-                    self.SupposedTrue = false;
-                } else if input_colors.contains(&None) {
-                    self.KnownTrue = false;
-                } else {
-                    self.KnownTrue = false;
-                    self.SupposedTrue = false;
-                }
-            }
-            Some(Gate::And) => {
-                let input_colors = FxHashSet::from_iter(
-                    env.circuit
-                        .inputs(&bag.x)
-                        .cloned()
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|input| bag_assign.assignment.get(input)),
-                );
-                if input_colors.contains(&Some(&AssignValue::False)) {
-                    self.KnownTrue = false;
-                    self.SupposedTrue = false;
-                } else if input_colors.contains(&None) {
-                    self.KnownTrue = false;
-                } else {
-                    self.False = false;
-                    self.SupposedTrue = false;
-                }
-            }
-            None => {}
-        }
-    }
-
-    fn restrict(
-        &mut self,
-        env: &Env,
-        bag: &Insert,
-        bag_assign: &Assignment,
-        full_assign: &Assignment,
-    ) {
-        if env.circuit.gate_type(&bag.x) == Some(&Gate::Variable) {
-            self.SupposedTrue = false;
-        }
-        self.restrict_by_outputs(env, bag, bag_assign, full_assign);
-        self.restrict_by_inputs(env, bag, bag_assign, full_assign);
-    }
-}
-
-impl Default for AssignValueIndicator {
-    fn default() -> Self {
-        AssignValueIndicator {
-            False: true,
-            KnownTrue: true,
-            SupposedTrue: true,
-        }
-    }
-}
-
-impl NiceBag for Insert {
-    // For an insert node, add all possible assignments to the new vertex, and upgrade
-    // any SupposedTrue outputs
-    fn get_assignments<'a>(&self, env: &Env) -> ExtendAssigns {
-        let mut ea = ExtendAssigns::default();
-        let child_assignments = self.child.get_assignments(env).0;
-        for (bag_assign, full_assign) in &child_assignments {
-            let mut allowed_values = AssignValueIndicator::default();
-            allowed_values.restrict(env, self, bag_assign, full_assign);
-
-            for value in allowed_values.to_vec() {
-                let mut new_bag_assign = bag_assign.assignment.clone();
-                let mut new_full_assign = full_assign.assignment.clone();
-                new_bag_assign.insert(self.x, value);
-                new_full_assign.insert(self.x, value);
-
-                let parents: FxHashSet<usize> =
-                    env.circuit.outputs(&self.x).cloned().unwrap_or_default();
-                for p in parents {
-                    if bag_assign.assignment.get(&p) == Some(&AssignValue::SupposedTrue) {
-                        match env.circuit.gate_type(&p) {
-                            Some(&Gate::Or) => {
-                                if value.to_bool() {
-                                    new_bag_assign.insert(p, AssignValue::KnownTrue);
-                                    new_full_assign.insert(p, AssignValue::KnownTrue);
+                    match env.circuit.gate_type_or_unreachable(&out) {
+                        Gate::Or => match bag_assign.map.get(&out) {
+                            // To be symmetric with And gates, this False case is really both
+                            // SupposedFalse and KnownFalse together. But KnownFalse is
+                            // unreachable, so we can interpret this False as SupposedFalse.
+                            Some(AssignValue::False) => {
+                                self.0[1] = false; // SupposedTrue
+                                self.0[2] = false; // KnownTrue
+                            }
+                            Some(AssignValue::KnownTrue) => {}
+                            Some(AssignValue::SupposedTrue) => {
+                                let siblings = env.circuit.inputs_or_unreachable(&out);
+                                let mut set_gates: IntSet<usize> = full_assign.map.keys().cloned().collect();
+                                set_gates.insert(*x);
+                                if siblings.is_subset(&set_gates) {
+                                    self.0[0] = false; // False
                                 }
                             }
-                            Some(&Gate::And) => {
-                                if env.circuit.inputs(&p).cloned().unwrap().iter().all(|u| {
-                                    new_full_assign.get(u).map(|value| value.to_bool())
-                                        == Some(true)
-                                }) {
-                                    new_bag_assign.insert(p, AssignValue::KnownTrue);
-                                    new_full_assign.insert(p, AssignValue::KnownTrue);
-                                }
+                            None => {
+                                unreachable!()
                             }
-                            Some(&Gate::Variable) => {} // case not possible
+                        },
+                        Gate::And => match bag_assign.map.get(&out) {
+                            // To be symmetric with Or gates, this False case is really both
+                            // SupposedFalse and KnownFalse together. Now both are reachable,
+                            // but KnownFalse places no restrictions while SupposedFalse restricts
+                            // x being KnownTrue or SupposedTrue when it is the last unassigned
+                            // child of out. However, it is safe to ignore this because the 
+                            // circuit is monotone - the assignment with out as true instead is
+                            // sound and can only be better or same.
+                            Some(AssignValue::False) => {}
+                            Some(AssignValue::KnownTrue) => {
+                                unreachable!()
+                            }
+                            Some(AssignValue::SupposedTrue) => {
+                                self.0[0] = false; // False
+                            }
                             None => {}
-                        }
+                        },
+                        Gate::Variable => {}
                     }
                 }
-
-                ea.add_if_better(
-                    env,
-                    Assignment::new(new_bag_assign, env),
-                    Assignment::new(new_full_assign, env),
-                );
             }
+            _ => unreachable!(),
         }
-        ea
     }
 
-    fn vertices(&self) -> &FxHashSet<usize> {
-        &self.vertices
+    fn restrict_by_inputs(&mut self, bag: &NiceBag, bag_assign: &Assignment, env: &Env) {
+        match bag {
+            NiceBag::Insert { vertices: _, child: _, x, } => {
+                match env.circuit.gate_type_or_unreachable(x) {
+                    Gate::Or => {
+                        let input_colors = FxHashSet::from_iter(
+                            env.circuit
+                                .inputs_or_unreachable(x)
+                                .iter()
+                                .map(|input| bag_assign.map.get(input)),
+                        );
+                        if input_colors.contains(&Some(&AssignValue::KnownTrue))
+                            || input_colors.contains(&Some(&AssignValue::SupposedTrue))
+                        {
+                            self.0[0] = false; // False
+                            self.0[1] = false; // SupposedTrue
+                        } else if input_colors.contains(&None) {
+                            self.0[2] = false; // KnownTrue
+                        } else { // All inputs are False
+                            self.0[1] = false; // SupposedTrue
+                            self.0[2] = false; // KnownTrue
+                        }
+                    }
+                    Gate::And => {
+                        let input_colors = FxHashSet::from_iter(
+                            env.circuit
+                                .inputs_or_unreachable(x)
+                                .iter()
+                                .map(|input| bag_assign.map.get(input)),
+                        );
+                        if input_colors.contains(&Some(&AssignValue::False)) {
+                            self.0[1] = false; // SupposedTrue
+                            self.0[2] = false; // KnownTrue
+                        } else if input_colors.contains(&None) {
+                            self.0[2] = false; // KnownTrue
+                        } else { // All inputs are SupposedTrue or KnownTrue
+                            self.0[0] = false; // False
+                            self.0[1] = false; // SupposedTrue
+                        }
+                    }
+                    Gate::Variable => {}
+                }
+            }
+            _ => unreachable!(),
+        }
     }
 
-    fn n_bags(&self) -> usize {
-        self.n_bags
+    fn restrict(&mut self, bag: &NiceBag, bag_assign: &Assignment, full_assign: &Assignment, env: &Env) {
+        self.restrict_by_outputs(bag, bag_assign, full_assign, env);
+        self.restrict_by_inputs(bag, bag_assign, env);
     }
 
-    fn avg_bag_size(&self) -> f32 {
-        self.avg_bag_size
+    fn to_vec(&self) -> Vec<AssignValue> {
+        let mut v: Vec<AssignValue> = Vec::with_capacity(3);
+        if self.0[0] {
+            v.push(AssignValue::False);
+        }
+        if self.0[1] {
+            v.push(AssignValue::SupposedTrue);
+        }
+        if self.0[2] {
+            v.push(AssignValue::KnownTrue)
+        }
+        v
     }
 }
 
 #[derive(Debug)]
-struct Forget {
-    vertices: FxHashSet<usize>,
-    child: Box<dyn NiceBag>,
-    x: usize,
-    n_bags: usize,
-    avg_bag_size: f32,
+enum NiceBag {
+    Leaf {
+        vertices: IntSet<usize>,
+    },
+    Insert {
+        vertices: IntSet<usize>,
+        child: Box<NiceBag>,
+        x: usize,
+    },
+    Forget {
+        vertices: IntSet<usize>,
+        child: Box<NiceBag>,
+        x: usize,
+    },
+    Join {
+        vertices: IntSet<usize>,
+        child1: Box<NiceBag>,
+        child2: Box<NiceBag>,
+    },
 }
 
-impl Forget {
-    fn new(vertices: FxHashSet<usize>, child: Box<dyn NiceBag>, x: usize) -> Self {
-        let child_n_bags = child.n_bags();
-        let child_bag_size = child.avg_bag_size();
-        let size = vertices.len();
-        Forget {
-            vertices,
-            child,
-            x,
-            n_bags: child_n_bags + 1,
-            avg_bag_size: (child_n_bags as f32 * child_bag_size + size as f32)
-                / (child_n_bags + 1) as f32,
-        }
-    }
-}
-
-// When forgetting x, project onto the rest of the bag and keep only the best
-impl NiceBag for Forget {
+impl NiceBag {
     fn get_assignments(&self, env: &Env) -> ExtendAssigns {
         let mut ea = ExtendAssigns::default();
-        let child_assignments = self.child.get_assignments(env).0;
-        for (bag_assign, full_assign) in &child_assignments {
-            let mut new_bag_assign = bag_assign.clone();
-            new_bag_assign.assignment.remove(&self.x);
-            ea.add_if_better(env, new_bag_assign, full_assign.clone());
-        }
-        ea
-    }
+        match self {
+            NiceBag::Leaf { vertices: _ } => {
+                ea.add_if_better(env, Assignment::default(), Assignment::default());
+                ea
+            }
 
-    fn vertices(&self) -> &FxHashSet<usize> {
-        &self.vertices
-    }
-
-    fn n_bags(&self) -> usize {
-        self.n_bags
-    }
-
-    fn avg_bag_size(&self) -> f32 {
-        self.avg_bag_size
-    }
-}
-
-#[derive(Debug)]
-struct Join {
-    vertices: FxHashSet<usize>,
-    child1: Box<dyn NiceBag>,
-    child2: Box<dyn NiceBag>,
-    n_bags: usize,
-    avg_bag_size: f32,
-}
-
-impl Join {
-    fn new(vertices: FxHashSet<usize>, child1: Box<dyn NiceBag>, child2: Box<dyn NiceBag>) -> Self {
-        let child1_n_bags = child1.n_bags();
-        let child2_n_bags = child2.n_bags();
-        let child1_bag_size = child1.avg_bag_size();
-        let child2_bag_size = child2.avg_bag_size();
-        let size = vertices.len();
-        Join {
-            vertices,
-            child1,
-            child2,
-            n_bags: child1_n_bags + child2_n_bags + 1,
-            avg_bag_size: (child1_n_bags as f32 * child1_bag_size
-                + child2_n_bags as f32 * child2_bag_size
-                + size as f32)
-                / (child1_n_bags + child2_n_bags + 1) as f32,
-        }
-    }
-}
-
-impl NiceBag for Join {
-    fn get_assignments(&self, env: &Env) -> ExtendAssigns {
-        let mut ea = ExtendAssigns::default();
-        let child1_assignments = self.child1.get_assignments(env).0;
-        let child2_assignments = self.child2.get_assignments(env).0;
-        for (bag_assign1, full_assign1) in &child1_assignments {
-            for (bag_assign2, full_assign2) in &child2_assignments {
-                let mut new_bag_assign: BTreeMap<usize, AssignValue> = BTreeMap::default();
-                let mut valid = true;
-                for u in self.vertices.iter() {
-                    match (bag_assign1.assignment.get(u), bag_assign2.assignment.get(u)) {
-                        (Some(AssignValue::False), Some(AssignValue::False)) => {
-                            new_bag_assign.insert(*u, AssignValue::False);
+            NiceBag::Insert { vertices: _, child, x } => {
+                let child_assignments = child.get_assignments(env).0;
+                for (bag_assign, full_assign) in &child_assignments {
+                    let mut pv = PossibleValues::from_vertex(*x, env);
+                    pv.restrict(self, bag_assign, full_assign, env);
+        
+                    for value in pv.to_vec() {
+                        let mut new_full_assign = full_assign.clone();
+                        new_full_assign.insert(*x, value);
+                        if new_full_assign.exists_cycle(env) || !new_full_assign.is_deterministic(env) {
+                            continue;
                         }
-                        (Some(AssignValue::KnownTrue), Some(AssignValue::KnownTrue)) => {
-                            new_bag_assign.insert(*u, AssignValue::KnownTrue);
-                        }
-                        (Some(AssignValue::SupposedTrue), Some(AssignValue::KnownTrue)) => {
-                            new_bag_assign.insert(*u, AssignValue::KnownTrue);
-                        }
-                        (Some(AssignValue::KnownTrue), Some(AssignValue::SupposedTrue)) => {
-                            new_bag_assign.insert(*u, AssignValue::KnownTrue);
-                        }
-                        (Some(AssignValue::SupposedTrue), Some(AssignValue::SupposedTrue)) => {
-                            match env.circuit.gate_type(u) {
-                                Some(Gate::Variable) => {}
-                                Some(Gate::And) => {
-                                    if env.circuit.inputs(u).cloned().unwrap().iter().all(|v| {
-                                        full_assign1.assignment.contains_key(v)
-                                            || full_assign2.assignment.contains_key(v)
-                                    }) {
-                                        new_bag_assign.insert(*u, AssignValue::KnownTrue);
-                                    } else {
-                                        new_bag_assign.insert(*u, AssignValue::SupposedTrue);
+
+                        let mut new_bag_assign = bag_assign.clone();
+                        new_bag_assign.insert(*x, value);
+
+                        // Upgrade SupposedTrue to KnownTrue if needed
+                        for u in env.circuit.outputs_or_unreachable(x) {
+                            if bag_assign.map.get(u) == Some(&AssignValue::SupposedTrue) {
+                                match env.circuit.gate_type(u) {
+                                    Some(&Gate::Or) => {
+                                        if value.to_bool() {
+                                            new_bag_assign.insert(*u, AssignValue::KnownTrue);
+                                            new_full_assign.insert(*u, AssignValue::KnownTrue);
+                                        }
                                     }
-                                }
-                                Some(Gate::Or) => {
-                                    if env.circuit.inputs(u).cloned().unwrap().iter().all(|v| {
-                                        full_assign1.assignment.contains_key(v)
-                                            || full_assign2.assignment.contains_key(v)
-                                    }) {
-                                        valid = false;
-                                        break;
-                                    } else {
-                                        new_bag_assign.insert(*u, AssignValue::SupposedTrue);
+                                    Some(&Gate::And) => {
+                                        if env.circuit.inputs_or_unreachable(u).iter().all(|v| {
+                                            new_full_assign.map.get(v).map(|value| value.to_bool())
+                                                == Some(true)
+                                        }) {
+                                            new_bag_assign.insert(*u, AssignValue::KnownTrue);
+                                            new_full_assign.insert(*u, AssignValue::KnownTrue);
+                                        }
                                     }
+                                    Some(&Gate::Variable) => {} // case not possible
+                                    None => {}
                                 }
-                                None => {}
                             }
                         }
-                        _ => {
-                            valid = false;
-                            break;
+                        ea.add_if_better(env, new_bag_assign, new_full_assign);
+                    }
+                }
+                ea
+            }
+            NiceBag::Forget { vertices: _, child, x } => {
+                let child_assignments = child.get_assignments(env).0;
+                for (bag_assign, full_assign) in &child_assignments {
+                    let mut new_bag_assign = bag_assign.clone();
+                    new_bag_assign.remove(x);
+                    ea.add_if_better(env, new_bag_assign, full_assign.clone());
+                }
+                ea
+            }
+            NiceBag::Join { vertices, child1, child2 } => {
+                let child1_assignments = child1.get_assignments(env).0;
+                let child2_assignments = child2.get_assignments(env).0;
+                for (bag_assign1, full_assign1) in &child1_assignments {
+                    for (bag_assign2, full_assign2) in &child2_assignments {
+                        let mut new_bag_assign = Assignment::default();
+                        let mut valid = true;
+                        for u in vertices {
+                            match (bag_assign1.map.get(u), bag_assign2.map.get(u)) {
+                                (Some(AssignValue::False), Some(AssignValue::False)) => {
+                                    new_bag_assign.insert(*u, AssignValue::False);
+                                }
+                                (Some(AssignValue::KnownTrue), Some(AssignValue::KnownTrue)) => {
+                                    new_bag_assign.insert(*u, AssignValue::KnownTrue);
+                                }
+                                (Some(AssignValue::SupposedTrue), Some(AssignValue::KnownTrue)) => {
+                                    new_bag_assign.insert(*u, AssignValue::KnownTrue);
+                                }
+                                (Some(AssignValue::KnownTrue), Some(AssignValue::SupposedTrue)) => {
+                                    new_bag_assign.insert(*u, AssignValue::KnownTrue);
+                                }
+                                (Some(AssignValue::SupposedTrue), Some(AssignValue::SupposedTrue)) => {
+                                    match env.circuit.gate_type(u) {
+                                        Some(Gate::Variable) => {}
+                                        Some(Gate::And) => {
+                                            if env.circuit.inputs_or_unreachable(u).iter().all(|v| {
+                                                full_assign1.map.contains_key(v)
+                                                    || full_assign2.map.contains_key(v)
+                                            }) {
+                                                new_bag_assign.insert(*u, AssignValue::KnownTrue);
+                                            } else {
+                                                new_bag_assign.insert(*u, AssignValue::SupposedTrue);
+                                            }
+                                        }
+                                        Some(Gate::Or) => {
+                                            if env.circuit.inputs_or_unreachable(u).iter().all(|v| {
+                                                full_assign1.map.contains_key(v)
+                                                    || full_assign2.map.contains_key(v)
+                                            }) {
+                                                valid = false;
+                                                break;
+                                            } else {
+                                                new_bag_assign.insert(*u, AssignValue::SupposedTrue);
+                                            }
+                                        }
+                                        None => {}
+                                    }
+                                }
+                                _ => {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if valid {
+                            let mut new_full_assign = new_bag_assign.clone();
+                            for (u, value) in full_assign1.map.iter() {
+                                if !vertices.contains(u) {
+                                    new_full_assign.insert(*u, *value);
+                                }
+                            }
+                            for (u, value) in full_assign2.map.iter() {
+                                if !vertices.contains(u) {
+                                    new_full_assign.insert(*u, *value);
+                                }
+                            }
+
+                            if new_full_assign.exists_cycle(env) || !new_full_assign.is_deterministic(env) {
+                                continue;
+                            }
+
+                            ea.add_if_better(
+                                env,
+                                new_bag_assign,
+                                new_full_assign,
+                            );
                         }
                     }
                 }
-                if valid {
-                    let mut new_full_assign = new_bag_assign.clone();
-                    for (u, value) in full_assign1.assignment.iter() {
-                        if !self.vertices.contains(u) {
-                            new_full_assign.insert(*u, *value);
-                        }
-                    }
-                    for (u, value) in full_assign2.assignment.iter() {
-                        if !self.vertices.contains(u) {
-                            new_full_assign.insert(*u, *value);
-                        }
-                    }
-                    ea.add_if_better(
-                        env,
-                        Assignment::new(new_bag_assign, env),
-                        Assignment::new(new_full_assign, env),
-                    );
-                }
+                ea
             }
         }
-        ea
     }
 
-    fn vertices(&self) -> &FxHashSet<usize> {
-        &self.vertices
+    fn vertices(&self) -> &IntSet<usize> {
+        match self {
+            NiceBag::Leaf { vertices } => vertices,
+            NiceBag::Insert { vertices, child: _, x: _ } => vertices,
+            NiceBag::Forget { vertices, child: _, x: _ } => vertices,
+            NiceBag::Join { vertices, child1: _, child2: _ } => vertices,
+        }
     }
 
-    fn n_bags(&self) -> usize {
-        self.n_bags
+    fn new_leaf() -> Self {
+        NiceBag::Leaf { vertices: IntSet::default() }
     }
 
-    fn avg_bag_size(&self) -> f32 {
-        self.avg_bag_size
+    fn new_insert(vertices: IntSet<usize>, child: Box<NiceBag>, x: usize) -> NiceBag {
+        NiceBag::Insert { vertices, child, x }
+    }
+
+    fn new_forget(vertices: IntSet<usize>, child: Box<NiceBag>, x: usize) -> NiceBag {
+        NiceBag::Forget { vertices, child, x }
+    }
+
+    fn new_join(vertices: IntSet<usize>, child1: Box<NiceBag>, child2: Box<NiceBag>) -> NiceBag {
+        NiceBag::Join { vertices, child1, child2 }
     }
 }
+
+
 
 fn to_nice_decomp(
     td: &TreeDecomposition,
     root_bag_id: &usize,
     parent_id: Option<&usize>,
-) -> Box<dyn NiceBag> {
+) -> Box<NiceBag> {
     let root_bag = &td.bags[*root_bag_id];
     let mut child_ids = root_bag.neighbors.clone();
     parent_id.map(|u| child_ids.remove(u));
     if child_ids.is_empty() {
-        let mut prev: Box<dyn NiceBag> = Box::new(Leaf::new());
-        let mut vertices: FxHashSet<usize> = FxHashSet::default();
+        let mut prev: Box<NiceBag> = Box::new(NiceBag::new_leaf());
+        let mut vertices: IntSet<usize> = IntSet::default();
         for u in root_bag.vertex_set.iter() {
             vertices.insert(*u);
-            let next = Insert::new(vertices.clone(), prev, *u);
+            let next = NiceBag::new_insert(vertices.clone(), prev, *u);
             prev = Box::new(next);
         }
         return prev;
     }
 
-    let mut same_as_root_bag: Vec<Box<dyn NiceBag>> = Vec::default();
+    let mut same_as_root_bag: Vec<Box<NiceBag>> = Vec::default();
 
     let child_nice_bags = child_ids
         .iter()
@@ -848,18 +763,18 @@ fn to_nice_decomp(
         let mut vertices = prev.vertices().clone();
         let vertices_clone = vertices.clone();
 
-        let root_vertices = FxHashSet::from_iter(root_bag.vertex_set.clone().into_iter());
+        let root_vertices = IntSet::from_iter(root_bag.vertex_set.clone().into_iter());
         let root_not_child = root_vertices.difference(&vertices_clone);
         let child_not_root = vertices_clone.difference(&root_vertices);
 
         for u in child_not_root {
             vertices.remove(u);
-            let next = Forget::new(vertices.clone(), prev, *u);
+            let next = NiceBag::new_forget(vertices.clone(), prev, *u);
             prev = Box::new(next);
         }
         for u in root_not_child {
             vertices.insert(*u);
-            let next = Insert::new(vertices.clone(), prev, *u);
+            let next = NiceBag::new_insert(vertices.clone(), prev, *u);
             prev = Box::new(next);
         }
         same_as_root_bag.push(prev);
@@ -868,23 +783,23 @@ fn to_nice_decomp(
     if let Some(mut prev) = same_as_root_bag.pop() {
         let vertices = prev.vertices().clone();
         for bag in same_as_root_bag {
-            let join = Join::new(vertices.clone(), prev, bag);
+            let join = NiceBag::new_join(vertices.clone(), prev, bag);
             prev = Box::new(join);
         }
         return prev;
     }
 
-    Box::new(Leaf::new())
+    Box::new(NiceBag::new_leaf())
 }
 
-fn forget_until_root(nice_td: Box<dyn NiceBag>, root_id: &usize) -> Box<dyn NiceBag> {
+fn forget_until_root(nice_td: Box<NiceBag>, root_id: &usize) -> Box<NiceBag> {
     let mut prev = nice_td;
     let mut vertices = prev.vertices().clone();
     let vertices_clone = vertices.clone();
     for u in vertices_clone.iter() {
         if u != root_id {
             vertices.remove(u);
-            let next = Forget::new(vertices.clone(), prev, *u);
+            let next = NiceBag::new_forget(vertices.clone(), prev, *u);
             prev = Box::new(next);
         }
     }
@@ -933,7 +848,7 @@ fn simplify(mut circuit: Circuit, options: SimplifyOptions) -> Circuit {
         if options.remove_unreachable {
             let mut call_stack: Vec<usize> = Vec::default();
             call_stack.push(circuit.root_id);
-            let mut visited: FxHashSet<usize> = FxHashSet::default();
+            let mut visited: IntSet<usize> = IntSet::default();
 
             while let Some(u) = call_stack.pop() {
                 if visited.contains(&u) {
@@ -1039,13 +954,16 @@ impl Extractor for TreewidthExtractor {
         let start_time = std::time::Instant::now();
 
         // Make ClassIds and NodeIds compatible with arboretum_td
-        let mut id_converter = IdConverter::new();
+        let mut id_converter = IdConverter::default();
         for (cid, class) in egraph.classes() {
-            id_converter.add_class(cid.clone());
+            id_converter.get_oid_or_add_class(cid);
             for nid in class.nodes.iter() {
-                id_converter.add_node(nid.clone());
+                id_converter.get_aid_or_add_node(nid);
+                id_converter.get_vid_or_add_node(nid);
             }
         }
+        println!("{}", egraph.classes().len());
+        println!("{}", egraph.nodes.len());
 
         // Create circuit by replacing e-classes with Or gates and e-nodes
         // with both an And gate (to its input classes) and a Variable gate
@@ -1054,40 +972,35 @@ impl Extractor for TreewidthExtractor {
 
         let mut circuit = Circuit::new(root_id);
         for (cid, class) in egraph.classes() {
-            if let Some(u) = id_converter.cid_to_oid(cid) {
-                circuit.add_vertex(*u, Gate::Or);
+            let u = id_converter.get_oid_or_add_class(cid);
+            circuit.add_vertex(u, Gate::Or);
 
-                for nid in class.nodes.iter() {
-                    if let Some(v) = id_converter.nid_to_aid(nid) {
-                        circuit.add_vertex(*v, Gate::And);
-                        circuit.add_edge(*v, *u);
+            for nid in class.nodes.iter() {
+                let v = id_converter.get_aid_or_add_node(nid);
+                circuit.add_vertex(v, Gate::And);
+                circuit.add_edge(v, u);
 
-                        if let Some(node) = egraph.nodes.get(nid) {
-                            for child_nid in node.children.iter() {
-                                if let Some(w) =
-                                    id_converter.cid_to_oid(egraph.nid_to_cid(child_nid))
-                                {
-                                    circuit.add_edge(*w, *v);
-                                }
-                            }
-                        }
-
-                        if let Some(w) = id_converter.nid_to_vid(nid) {
-                            circuit.add_vertex(*w, Gate::Variable);
-                            circuit.add_edge(*w, *v);
-                        }
+                if let Some(node) = egraph.nodes.get(nid) {
+                    for child_nid in node.children.iter() {
+                        let w = id_converter.get_oid_or_add_class(egraph.nid_to_cid(child_nid));
+                        circuit.add_vertex(w, Gate::Or);
+                        circuit.add_edge(w, v);
                     }
                 }
+
+                let w = id_converter.get_vid_or_add_node(nid);
+                circuit.add_vertex(w, Gate::Variable);
+                circuit.add_edge(w, v);
             }
+            
         }
 
         // Require extraction of all roots by joining all the root e-classes
         // to a new And gate at the top.
         circuit.add_vertex(root_id, Gate::And);
         for root in roots {
-            if let Some(v) = id_converter.cid_to_oid(root) {
-                circuit.add_edge(*v, root_id);
-            }
+            let v = id_converter.get_oid_or_add_class(root);
+            circuit.add_edge(v, root_id);
         }
 
         let options = SimplifyOptions {
@@ -1099,15 +1012,23 @@ impl Extractor for TreewidthExtractor {
         };
         circuit = simplify(circuit, options);
 
-        // Build underlying undirected graph from circuit
-        let mut graph = HashMapGraph::new();
-        for u in circuit.get_vertices() {
-            if let Some(vs) = circuit.inputs(u) {
-                for v in vs {
-                    graph.add_edge(*u, *v);
-                }
-            }
-        }
+        // for u in circuit.get_vertices() {
+        //     for v in circuit.outputs(u).unwrap_or(&IntSet::default()) {
+        //         println!("{u},{v},white");
+        //     }
+        // }
+
+        // for u in circuit.get_vertices() {
+        //     let color = match circuit.gate_type(u) {
+        //         Some(Gate::And) => "#ff9c9c",
+        //         Some(Gate::Or) => "#9fff9c",
+        //         Some(Gate::Variable) => "#9cd6ff",
+        //         None => "black",
+        //     };
+        //     println!("{u},{color}");
+        // }
+
+        let graph = circuit.to_graph();
 
         println!("preprocessing: {} us", start_time.elapsed().as_micros());
         let start_time = std::time::Instant::now();
@@ -1128,8 +1049,8 @@ impl Extractor for TreewidthExtractor {
 
         let nice_td = forget_until_root(to_nice_decomp(&td, &root_bag_id, None), &root_id);
 
-        println!("number of bags: {}", nice_td.n_bags());
-        println!("average bag size: {}", nice_td.avg_bag_size());
+        // println!("number of bags: {}", nice_td.n_bags());
+        // println!("average bag size: {}", nice_td.avg_bag_size());
         println!("max bag size: {}", td.max_bag_size);
 
         println!("nice td: {} us", start_time.elapsed().as_micros());
@@ -1138,13 +1059,13 @@ impl Extractor for TreewidthExtractor {
         // Find the best satisfying assignment
         let env = Env::new(id_converter, circuit, egraph);
         let ea = nice_td.get_assignments(&env);
-        let mut root_assign_map: BTreeMap<usize, AssignValue> = BTreeMap::default();
+        let mut root_assign_map: IntMap<usize, AssignValue> = IntMap::default();
         root_assign_map.insert(root_id, AssignValue::KnownTrue);
-        let root_assign = Assignment::new(root_assign_map, &env);
+        let root_assign = Assignment::from_map(root_assign_map);
 
         let mut result = ExtractionResult::default();
         if let Some(best_assign) = ea.0.get(&root_assign) {
-            for (u, value) in best_assign.assignment.iter() {
+            for (u, value) in best_assign.map.iter() {
                 if let Some(nid) = env.id_converter.vid_to_nid(u) {
                     if value == &AssignValue::KnownTrue || value == &AssignValue::SupposedTrue {
                         result.choose(egraph.nid_to_cid(nid).clone(), nid.clone());
@@ -1152,6 +1073,8 @@ impl Extractor for TreewidthExtractor {
                 }
             }
         }
+        //println!("{:#?}", ea);
+
 
         println!("extract: {} us", start_time.elapsed().as_micros());
 
