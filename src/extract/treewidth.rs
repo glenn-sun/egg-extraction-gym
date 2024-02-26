@@ -1,4 +1,8 @@
+use std::env::var;
+use std::error::Error;
 use std::hash::{Hash, Hasher, BuildHasherDefault};
+use std::collections::HashSet;
+use csv::Writer;
 
 use super::*;
 use arboretum_td::graph::{HashMapGraph, MutableGraph};
@@ -15,9 +19,7 @@ pub struct TreewidthExtractor;
 /// and segregates IDs for Variables, And gates, and Or gates.
 #[derive(Debug, Default)]
 struct IdConverter {
-    oid_to_cid: IntMap<usize, ClassId>,
-    aid_to_nid: IntMap<usize, NodeId>,
-    vid_to_nid: IntMap<usize, NodeId>,
+    vid_to_nid_set: IntMap<usize, FxHashSet<NodeId>>,
     cid_to_oid: FxHashMap<ClassId, usize>,
     nid_to_aid: FxHashMap<NodeId, usize>,
     nid_to_vid: FxHashMap<NodeId, usize>,
@@ -29,7 +31,6 @@ impl IdConverter {
         if let Some(oid) = self.cid_to_oid.get(cid) {
             *oid
         } else {
-            self.oid_to_cid.insert(self.counter, cid.clone());
             self.cid_to_oid.insert(cid.clone(), self.counter);
             self.counter += 1;
             self.counter - 1
@@ -40,7 +41,6 @@ impl IdConverter {
         if let Some(aid) = self.nid_to_aid.get(&nid) {
             *aid
         } else {
-            self.aid_to_nid.insert(self.counter, nid.clone());
             self.nid_to_aid.insert(nid.clone(), self.counter);
             self.counter += 1;
             self.counter - 1
@@ -51,11 +51,22 @@ impl IdConverter {
         if let Some(vid) = self.nid_to_vid.get(&nid) {
             *vid
         } else {
-            self.vid_to_nid.insert(self.counter, nid.clone());
+            self.vid_to_nid_set.entry(self.counter).or_default().insert(nid.clone());
             self.nid_to_vid.insert(nid.clone(), self.counter);
             self.counter += 1;
             self.counter - 1
         }
+    }
+
+    fn merge_vid_keep1(&mut self, vid1: usize, vid2: usize) {
+        let nid_set1 = self.vid_to_nid_set.get(&vid1).cloned().unwrap();
+        let nid_set2 = self.vid_to_nid_set.get(&vid2).cloned().unwrap();
+        for nid in &nid_set2 {
+            self.nid_to_vid.insert(nid.clone(), vid1);
+        }
+        let union: FxHashSet<NodeId> = nid_set1.union(&nid_set2).cloned().collect();
+        self.vid_to_nid_set.insert(vid1, union);
+        self.vid_to_nid_set.remove(&vid2);
     }
 
     /// Reserve an ID that does not correspond to any e-class or e-node.
@@ -64,11 +75,12 @@ impl IdConverter {
         self.counter - 1
     }
 
-    fn vid_to_nid(&self, vid: &usize) -> Option<&NodeId> {
-        self.vid_to_nid.get(vid)
+    fn vid_to_nid_set(&self, vid: &usize) -> Option<&FxHashSet<NodeId>> {
+        self.vid_to_nid_set.get(vid)
     }
-    fn vid_to_nid_or_unreachable(&self, vid: &usize) -> &NodeId {
-        self.vid_to_nid.get(vid).unwrap_or_else(|| unreachable!())
+
+    fn vid_to_nid_set_or_unreachable(&self, vid: &usize) -> &FxHashSet<NodeId> {
+        self.vid_to_nid_set.get(vid).unwrap_or_else(|| unreachable!())
     }
 }
 
@@ -93,7 +105,7 @@ struct Circuit {
 }
 
 impl Circuit {
-    fn new(root_id: usize) -> Self {
+    fn with_root(root_id: usize) -> Self {
         Circuit {
             vertices: IntSet::default(),
             inputs: IntMap::default(),
@@ -184,22 +196,39 @@ impl Circuit {
         }
         graph
     }
-}
 
-/// An environment to be passed around various functions.
-struct Env<'a> {
-    id_converter: IdConverter,
-    circuit: Circuit,
-    egraph: &'a EGraph,
-}
-
-impl<'a> Env<'a> {
-    fn new(id_converter: IdConverter, circuit: Circuit, egraph: &'a EGraph) -> Self {
-        Env {
-            id_converter,
-            circuit,
-            egraph,
+    fn save_cosmograph(&self, filename_noext: String) -> Result<(), Box<dyn Error>> {
+        let mut data_writer = Writer::from_path(format!("{}.csv", filename_noext))?;
+        #[derive(serde::Serialize)]
+        struct CosmoData {
+            input: usize,
+            output: usize,
+            color: String,
         }
+        for u in self.get_vertices() {
+            for v in self.outputs(u).unwrap_or(&IntSet::default()) {
+                data_writer.serialize(CosmoData {input: *u, output: *v, color: String::from("white")})?;
+            }
+        }
+        data_writer.flush()?;
+
+        let mut meta_writer = Writer::from_path(format!("{}_meta.csv", filename_noext))?;
+        #[derive(serde::Serialize)]
+        struct CosmoMeta {
+            id: usize,
+            color: String,
+        }
+        for u in self.get_vertices() {
+            let color = match self.gate_type_or_unreachable(u) {
+                Gate::And => "#ff9c9c",
+                Gate::Or => "#9fff9c",
+                Gate::Variable => "#9cd6ff",
+            };
+            meta_writer.serialize(CosmoMeta {id: *u, color: color.to_string()})?;
+        }
+        meta_writer.flush()?;
+
+        Ok(())
     }
 }
 
@@ -265,6 +294,18 @@ impl Assignment {
             exists_cycle: None,
             is_deterministic: None,
             cost: None 
+        }
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        let map: HashMap<usize, AssignValue, BuildHasherDefault<NoHashHasher<usize>>> =
+                HashMap::with_capacity_and_hasher(capacity, BuildHasherDefault::default());
+        Assignment {
+            map,
+            true_vertices: IntSet::default(),
+            exists_cycle: None,
+            is_deterministic: None,
+            cost: None
         }
     }
 
@@ -357,16 +398,26 @@ impl Assignment {
     }
 
     fn cost(&mut self, env: &Env) -> Cost {
+        let cost_u = |u: &usize| -> Cost {
+            env.id_converter.vid_to_nid_set_or_unreachable(u).iter().map(|nid|
+                env.egraph.nodes.get(nid).unwrap().cost
+            ).sum()
+        };
+
         if let Some(answer) = self.cost {
             return answer;
         } else {
             let sum = self.true_vertices.iter()
                 .filter(|u| env.circuit.gate_type_or_unreachable(u) == &Gate::Variable)
-                .map(|u| env.egraph.nodes.get(env.id_converter.vid_to_nid_or_unreachable(u)).unwrap().cost)
+                .map(|u| cost_u(u))
                 .sum();
             self.cost = Some(sum);
             sum
         }
+    }
+
+    fn valid(&mut self, env: &Env) -> bool {
+        self.is_deterministic(env) && !self.exists_cycle(env) && self.cost(env) <= env.max_cost + 1e-5
     }
 }
 
@@ -435,9 +486,7 @@ impl PossibleValues {
                             Some(AssignValue::KnownTrue) => {}
                             Some(AssignValue::SupposedTrue) => {
                                 let siblings = env.circuit.inputs_or_unreachable(&out);
-                                let mut set_gates: IntSet<usize> = full_assign.map.keys().cloned().collect();
-                                set_gates.insert(*x);
-                                if siblings.is_subset(&set_gates) {
+                                if siblings.iter().all(|u| full_assign.map.get(u) == Some(&AssignValue::False) || u == x) {
                                     self.0[0] = false; // False
                                 }
                             }
@@ -447,13 +496,16 @@ impl PossibleValues {
                         },
                         Gate::And => match bag_assign.map.get(&out) {
                             // To be symmetric with Or gates, this False case is really both
-                            // SupposedFalse and KnownFalse together. Now both are reachable,
-                            // but KnownFalse places no restrictions while SupposedFalse restricts
-                            // x being KnownTrue or SupposedTrue when it is the last unassigned
-                            // child of out. However, it is safe to ignore this because the 
-                            // circuit is monotone - the assignment with out as true instead is
-                            // sound and can only be better or same.
-                            Some(AssignValue::False) => {}
+                            // SupposedFalse and KnownFalse together. Although KnownFalse
+                            // places no restrictions, we know that a sibling must be false,
+                            // so the following check for SupposedFalse will always pass.
+                            Some(AssignValue::False) => {
+                                let siblings = env.circuit.inputs_or_unreachable(&out);
+                                if siblings.iter().all(|u| full_assign.true_vertices.contains(u) || u == x) {
+                                    self.0[1] = false; // SupposedTrue
+                                    self.0[2] = false; // KnownTrue
+                                }
+                            }
                             Some(AssignValue::KnownTrue) => {
                                 unreachable!()
                             }
@@ -565,7 +617,6 @@ impl NiceBag {
         match self {
             NiceBag::Leaf { vertices: _ } => {
                 ea.add_if_better(env, Assignment::default(), Assignment::default());
-                ea
             }
 
             NiceBag::Insert { vertices: _, child, x } => {
@@ -577,7 +628,7 @@ impl NiceBag {
                     for value in pv.to_vec() {
                         let mut new_full_assign = full_assign.clone();
                         new_full_assign.insert(*x, value);
-                        if new_full_assign.exists_cycle(env) || !new_full_assign.is_deterministic(env) {
+                        if !new_full_assign.valid(env) {
                             continue;
                         }
 
@@ -611,23 +662,26 @@ impl NiceBag {
                         ea.add_if_better(env, new_bag_assign, new_full_assign);
                     }
                 }
-                ea
             }
             NiceBag::Forget { vertices: _, child, x } => {
                 let child_assignments = child.get_assignments(env).0;
+
                 for (bag_assign, full_assign) in &child_assignments {
                     let mut new_bag_assign = bag_assign.clone();
                     new_bag_assign.remove(x);
                     ea.add_if_better(env, new_bag_assign, full_assign.clone());
                 }
-                ea
             }
             NiceBag::Join { vertices, child1, child2 } => {
                 let child1_assignments = child1.get_assignments(env).0;
                 let child2_assignments = child2.get_assignments(env).0;
                 for (bag_assign1, full_assign1) in &child1_assignments {
                     for (bag_assign2, full_assign2) in &child2_assignments {
-                        let mut new_bag_assign = Assignment::default();
+                        if bag_assign1.true_vertices != bag_assign2.true_vertices {
+                            continue;
+                        }
+
+                        let mut new_bag_assign = Assignment::with_capacity(bag_assign1.map.len());
                         let mut valid = true;
                         for u in vertices {
                             match (bag_assign1.map.get(u), bag_assign2.map.get(u)) {
@@ -645,7 +699,7 @@ impl NiceBag {
                                 }
                                 (Some(AssignValue::SupposedTrue), Some(AssignValue::SupposedTrue)) => {
                                     match env.circuit.gate_type(u) {
-                                        Some(Gate::Variable) => {}
+                                        Some(Gate::Variable) => unreachable!(),
                                         Some(Gate::And) => {
                                             if env.circuit.inputs_or_unreachable(u).iter().all(|v| {
                                                 full_assign1.map.contains_key(v)
@@ -667,12 +721,11 @@ impl NiceBag {
                                                 new_bag_assign.insert(*u, AssignValue::SupposedTrue);
                                             }
                                         }
-                                        None => {}
+                                        None => unreachable!()
                                     }
                                 }
                                 _ => {
-                                    valid = false;
-                                    break;
+                                    unreachable!();
                                 }
                             }
                         }
@@ -689,7 +742,7 @@ impl NiceBag {
                                 }
                             }
 
-                            if new_full_assign.exists_cycle(env) || !new_full_assign.is_deterministic(env) {
+                            if !new_full_assign.valid(env) {
                                 continue;
                             }
 
@@ -701,9 +754,9 @@ impl NiceBag {
                         }
                     }
                 }
-                ea
-            }
+            }    
         }
+        ea
     }
 
     fn vertices(&self) -> &IntSet<usize> {
@@ -811,7 +864,7 @@ fn print_stats(circuit: &Circuit) {
     let num_edges = circuit
         .get_vertices()
         .iter()
-        .map(|u| circuit.inputs(u).cloned().unwrap_or_default().len() as f32)
+        .map(|u| circuit.inputs_or_unreachable(u).len() as f32)
         .sum::<f32>()
         / num_verts as f32;
     println!("|V|, |E|/|V| = {}, {}", num_verts, num_edges);
@@ -820,7 +873,10 @@ struct SimplifyOptions {
     pub remove_unreachable: bool,
     pub contract_indegree_one: bool,
     pub contract_same_gate: bool,
-    pub remove_self_loops: bool,
+    pub remove_lone_or_loops: bool,
+    pub same_gate_is_tree: bool,
+    pub distributivity: bool,
+    pub collect_variables: bool,
     pub verbose: bool,
 }
 
@@ -830,128 +886,222 @@ impl Default for SimplifyOptions {
             remove_unreachable: true,
             contract_indegree_one: true,
             contract_same_gate: true,
-            remove_self_loops: true,
+            remove_lone_or_loops: true,
+            same_gate_is_tree: true,
+            distributivity: true,
+            collect_variables: true,
             verbose: false,
         }
     }
 }
 
-fn simplify(mut circuit: Circuit, options: SimplifyOptions) -> Circuit {
-    if options.verbose {
-        println!("before simplify");
-        print_stats(&circuit);
+/// An environment to be passed around various functions.
+struct Env<'a> {
+    id_converter: IdConverter,
+    circuit: Circuit,
+    egraph: &'a EGraph,
+    max_cost: Cost,
+}
+
+impl<'a> Env<'a> {
+    fn new(id_converter: IdConverter, circuit: Circuit, egraph: &'a EGraph, max_cost: Cost) -> Self {
+        Env {
+            id_converter,
+            circuit,
+            egraph,
+            max_cost,
+        }
     }
 
-    let mut changed = true;
-    while changed {
-        changed = false;
-        if options.remove_unreachable {
-            let mut call_stack: Vec<usize> = Vec::default();
-            call_stack.push(circuit.root_id);
-            let mut visited: IntSet<usize> = IntSet::default();
-
-            while let Some(u) = call_stack.pop() {
-                if visited.contains(&u) {
-                    continue;
-                }
-                visited.insert(u);
-                if let Some(inputs) = circuit.inputs(&u) {
-                    for v in inputs {
+    fn simplify(&mut self, options: SimplifyOptions) {
+        if options.verbose {
+            println!("before simplify");
+            print_stats(&self.circuit);
+        }
+    
+        let mut changed = true;
+        while changed {
+            changed = false;
+            if options.remove_unreachable {
+                let mut call_stack: Vec<usize> = Vec::default();
+                call_stack.push(self.circuit.root_id);
+                let mut visited: IntSet<usize> = IntSet::default();
+    
+                while let Some(u) = call_stack.pop() {
+                    if visited.contains(&u) {
+                        continue;
+                    }
+                    visited.insert(u);
+                    for v in self.circuit.inputs_or_unreachable(&u) {
                         call_stack.push(*v);
                     }
                 }
-            }
-
-            let vertices = circuit.get_vertices().clone();
-            for u in vertices {
-                if !visited.contains(&u) {
-                    circuit.remove_vertex(u);
-                    changed = true;
+    
+                let vertices = self.circuit.get_vertices().clone();
+                for u in vertices {
+                    if !visited.contains(&u) {
+                        self.circuit.remove_vertex(u);
+                        changed = true;
+                    }
+                }
+    
+                if options.verbose {
+                    println!("after remove unreachable");
+                    print_stats(&self.circuit);
                 }
             }
-
-            if options.verbose {
-                println!("after remove unreachable");
-                print_stats(&circuit);
-            }
-        }
-
-        if options.contract_indegree_one {
-            let vertices = circuit.get_vertices().clone();
-            for u in vertices {
-                if u == circuit.root_id {
-                    continue;
+    
+            if options.contract_indegree_one {
+                let vertices = self.circuit.get_vertices().clone();
+                for u in vertices {
+                    if u == self.circuit.root_id {
+                        continue;
+                    }
+                    let inputs = self.circuit.inputs_or_unreachable(&u);
+                    if inputs.len() == 1 {
+                        let v = inputs.into_iter().next().unwrap();
+                        self.circuit.contract_edge_remove_out(*v, u);
+                        changed = true;
+                    }
                 }
-                let inputs = circuit.inputs(&u).cloned().unwrap_or_default();
-                if inputs.len() == 1 {
-                    let v = inputs.into_iter().next().unwrap_or_default();
-                    circuit.contract_edge_remove_out(v, u);
-                    changed = true;
+                if options.verbose {
+                    println!("after contract indegree one");
+                    print_stats(&self.circuit);
                 }
             }
-            if options.verbose {
-                println!("after contract indegree one");
-                print_stats(&circuit);
-            }
-        }
-
-        if options.contract_same_gate {
-            let vertices = circuit.get_vertices().clone();
-            for u in vertices {
-                if u == circuit.root_id {
-                    continue;
-                }
-                let inputs = circuit.inputs(&u).cloned().unwrap_or_default();
-                for v in inputs {
-                    let outputs_v = circuit.outputs(&v).cloned().unwrap_or_default();
-                    if outputs_v.len() == 1 {
-                        match (circuit.gate_type(&u), circuit.gate_type(&v)) {
-                            (Some(Gate::And), Some(Gate::And)) => {
-                                circuit.contract_edge_remove_out(v, u);
-                                changed = true;
+    
+            if options.contract_same_gate {
+                let vertices = self.circuit.get_vertices().clone();
+                for u in vertices {
+                    if u == self.circuit.root_id {
+                        continue;
+                    }
+                    let inputs = self.circuit.inputs(&u).cloned().unwrap_or_default();
+                    for v in inputs {
+                        let outputs_v = self.circuit.outputs(&v).cloned().unwrap_or_default();
+                        if outputs_v.len() == 1 {
+                            match (self.circuit.gate_type(&u), self.circuit.gate_type(&v)) {
+                                (Some(Gate::And), Some(Gate::And)) => {
+                                    self.circuit.contract_edge_remove_out(v, u);
+                                    changed = true;
+                                }
+                                (Some(Gate::Or), Some(Gate::Or)) => {
+                                    self.circuit.contract_edge_remove_out(v, u);
+                                    changed = true;
+                                }
+                                _ => {}
                             }
-                            (Some(Gate::Or), Some(Gate::Or)) => {
-                                circuit.contract_edge_remove_out(v, u);
-                                changed = true;
-                            }
-                            _ => {}
                         }
                     }
                 }
-            }
-
-            if options.verbose {
-                println!("after contract same gate");
-                print_stats(&circuit);
-            }
-        }
-
-        if options.remove_self_loops {
-            let vertices = circuit.get_vertices().clone();
-            for u in vertices {
-                let inputs = circuit.inputs(&u).cloned().unwrap_or_default();
-                let outputs = circuit.outputs(&u).cloned().unwrap_or_default();
-                let mut intersection = inputs.intersection(&outputs);
-                if intersection
-                    .next()
-                    .is_some_and(|u| circuit.gate_type(u) == Some(&Gate::Or))
-                {
-                    circuit.remove_vertex(u);
-                    changed = true;
+    
+                if options.verbose {
+                    println!("after contract same gate");
+                    print_stats(&self.circuit);
                 }
             }
-            if options.verbose {
-                println!("after remove self loops");
-                print_stats(&circuit);
+    
+            if options.remove_lone_or_loops {
+                let vertices = self.circuit.get_vertices().clone();
+                for u in vertices {
+                    if self.circuit.gate_type_or_unreachable(&u) != &Gate::Or {
+                        continue;
+                    }
+    
+                    let mut call_stack: Vec<usize> = Vec::default();
+                    for v in self.circuit.outputs_or_unreachable(&u).clone() {
+                        if self.circuit.gate_type_or_unreachable(&v) == &Gate::And {
+                            call_stack.push(v);
+                        }
+                    }
+                    while let Some(v) = call_stack.pop() {
+                        for w in self.circuit.outputs_or_unreachable(&v).clone() {
+                            if self.circuit.gate_type_or_unreachable(&w) == &Gate::And {
+                                call_stack.push(w);
+                            }
+                            if w == u {
+                                self.circuit.remove_vertex(v);
+                            }
+                        }
+                    }
+                    
+                }
+                if options.verbose {
+                    println!("after remove loops with one or gate");
+                    print_stats(&self.circuit);
+                }
+            }
+    
+            if options.same_gate_is_tree {
+                let vertices = self.circuit.get_vertices().clone();
+                for u in &vertices {
+                    let inputs = self.circuit.inputs_or_unreachable(u).clone();
+                    let mut call_stack: Vec<usize> = Vec::default();
+                    for v in inputs.iter() {
+                        if self.circuit.gate_type_or_unreachable(v) == self.circuit.gate_type_or_unreachable(u) {
+                            call_stack.push(*v);
+                        }
+                    }
+                    while let Some(v) = call_stack.pop() {
+                        for w in self.circuit.inputs_or_unreachable(&v).clone() {
+                            if self.circuit.gate_type_or_unreachable(&w) == self.circuit.gate_type_or_unreachable(u) {
+                                call_stack.push(w);
+                            }
+                            if inputs.contains(&w) {
+                                self.circuit.remove_edge(w,* u);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+                if options.verbose {
+                    println!("after same gate subgraphs are trees");
+                    print_stats(&self.circuit);
+                }
+            }
+    
+            if options.distributivity {
+    
+            }
+    
+            if options.collect_variables {
+                let variables: Vec<usize> = self.circuit.get_vertices().clone().into_iter().filter(|u| self.circuit.gate_type_or_unreachable(u) == &Gate::Variable).collect();
+                let mut removed: FxHashSet<usize> = FxHashSet::default();
+                for u in &variables {
+                    if removed.contains(u) {
+                        continue;
+                    }
+                    let outputs = self.circuit.outputs_or_unreachable(u).clone();
+                    if !outputs.iter().all(|u| self.circuit.gate_type_or_unreachable(u) == &Gate::And) {
+                        continue;
+                    }
+                    for v in &variables {
+                        if removed.contains(v) || u == v {
+                            continue;
+                        }
+                        if self.circuit.outputs_or_unreachable(v) == &outputs {
+                            self.circuit.remove_vertex(*v);
+                            self.id_converter.merge_vid_keep1(*u, *v);
+                            removed.insert(*v);
+                            changed = true;
+                        }
+                    }
+                }
+
+                if options.verbose {
+                    println!("after collect variables");
+                    print_stats(&self.circuit);
+                }
             }
         }
     }
-    circuit
 }
 
 impl Extractor for TreewidthExtractor {
     fn extract(&self, egraph: &EGraph, roots: &[ClassId]) -> ExtractionResult {
         let start_time = std::time::Instant::now();
+
+        let max_cost = extract::faster_greedy_dag::FasterGreedyDagExtractor.boxed().extract(egraph, roots).dag_cost(egraph, roots);
 
         // Make ClassIds and NodeIds compatible with arboretum_td
         let mut id_converter = IdConverter::default();
@@ -969,8 +1119,9 @@ impl Extractor for TreewidthExtractor {
         // with both an And gate (to its input classes) and a Variable gate
         // under the And gate (selecting the e-node for extraction)
         let root_id = id_converter.reserve_id();
+        println!("root id: {}", root_id);
 
-        let mut circuit = Circuit::new(root_id);
+        let mut circuit = Circuit::with_root(root_id);
         for (cid, class) in egraph.classes() {
             let u = id_converter.get_oid_or_add_class(cid);
             circuit.add_vertex(u, Gate::Or);
@@ -1007,34 +1158,27 @@ impl Extractor for TreewidthExtractor {
             remove_unreachable: true,
             contract_indegree_one: true,
             contract_same_gate: true,
-            remove_self_loops: true,
+            remove_lone_or_loops: true,
+            same_gate_is_tree: true,
+            distributivity: true,
+            collect_variables: true,
             verbose: true,
         };
-        circuit = simplify(circuit, options);
+        let mut env = Env::new(id_converter, circuit, egraph, max_cost);
 
-        // for u in circuit.get_vertices() {
-        //     for v in circuit.outputs(u).unwrap_or(&IntSet::default()) {
-        //         println!("{u},{v},white");
-        //     }
-        // }
+        env.simplify(options);
+        env.circuit.save_cosmograph("cosmo".to_string()).expect("cosmo failed");
 
-        // for u in circuit.get_vertices() {
-        //     let color = match circuit.gate_type(u) {
-        //         Some(Gate::And) => "#ff9c9c",
-        //         Some(Gate::Or) => "#9fff9c",
-        //         Some(Gate::Variable) => "#9cd6ff",
-        //         None => "black",
-        //     };
-        //     println!("{u},{color}");
-        // }
 
-        let graph = circuit.to_graph();
+        let graph = env.circuit.to_graph();
 
         println!("preprocessing: {} us", start_time.elapsed().as_micros());
         let start_time = std::time::Instant::now();
 
         // Run tree decomposition and identify a bag with the root
-        let td = Solver::default_exact().solve(&graph);
+        let td = Solver::default_heuristic().solve(&graph);
+
+        //println!("td: {:#?}", td);
 
         println!("td: {} us", start_time.elapsed().as_micros());
         let start_time = std::time::Instant::now();
@@ -1046,7 +1190,7 @@ impl Extractor for TreewidthExtractor {
                 break;
             }
         }
-
+        println!("root bag id: {}", root_bag_id);
         let nice_td = forget_until_root(to_nice_decomp(&td, &root_bag_id, None), &root_id);
 
         // println!("number of bags: {}", nice_td.n_bags());
@@ -1057,7 +1201,6 @@ impl Extractor for TreewidthExtractor {
         let start_time = std::time::Instant::now();
 
         // Find the best satisfying assignment
-        let env = Env::new(id_converter, circuit, egraph);
         let ea = nice_td.get_assignments(&env);
         let mut root_assign_map: IntMap<usize, AssignValue> = IntMap::default();
         root_assign_map.insert(root_id, AssignValue::KnownTrue);
@@ -1066,14 +1209,16 @@ impl Extractor for TreewidthExtractor {
         let mut result = ExtractionResult::default();
         if let Some(best_assign) = ea.0.get(&root_assign) {
             for (u, value) in best_assign.map.iter() {
-                if let Some(nid) = env.id_converter.vid_to_nid(u) {
-                    if value == &AssignValue::KnownTrue || value == &AssignValue::SupposedTrue {
-                        result.choose(egraph.nid_to_cid(nid).clone(), nid.clone());
+                if let Some(nid_set) = env.id_converter.vid_to_nid_set(u) {
+                    for nid in nid_set {
+                        if value == &AssignValue::KnownTrue || value == &AssignValue::SupposedTrue {
+                            result.choose(egraph.nid_to_cid(nid).clone(), nid.clone());
+                        }
                     }
                 }
             }
         }
-        //println!("{:#?}", ea);
+        println!("{:#?}", ea);
 
 
         println!("extract: {} us", start_time.elapsed().as_micros());
