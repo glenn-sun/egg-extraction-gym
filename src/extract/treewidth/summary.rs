@@ -158,12 +158,12 @@ impl Hash for KnownTag {
 impl KnownTag {
     /// Intended for internal use. (Re)compute the tag of a vertex.
     /// This should be called whenever an input changes.
-    pub fn fix_tag_at(&mut self, u: &usize, full_eval: &Evaluation, env: &Env) {
+    fn fix_tag_at(&mut self, u: &usize, neighbor_eval: &Evaluation, env: &Env) {
         match env.circuit.gate_type_or_unreachable(u) {
             Gate::And => {
                 let inputs = env.circuit.inputs_or_unreachable(u);
                 for v in inputs {
-                    if full_eval.map.get(v).is_none() {
+                    if neighbor_eval.map.get(v).is_none() {
                         self.map.insert(*u, false);
                         return;
                     }
@@ -173,7 +173,7 @@ impl KnownTag {
             Gate::Or => {
                 let inputs = env.circuit.inputs_or_unreachable(u);
                 for v in inputs {
-                    if full_eval.map.get(v) == Some(&true) {
+                    if neighbor_eval.map.get(v) == Some(&true) {
                         self.map.insert(*u, true);
                         return;
                     }
@@ -191,14 +191,14 @@ impl KnownTag {
         &self,
         u: &usize,
         vertices: &IntSet<usize>,
-        full_eval: &Evaluation,
+        neighbor_eval: &Evaluation,
         env: &Env,
     ) -> KnownTag {
         let mut new_kt = self.clone();
-        new_kt.fix_tag_at(u, full_eval, env);
+        new_kt.fix_tag_at(u, neighbor_eval, env);
         for v in env.circuit.outputs_or_unreachable(u) {
-            if vertices.contains(v) && full_eval.map.get(v) == Some(&true) {
-                new_kt.fix_tag_at(v, full_eval, env);
+            if vertices.contains(v) && neighbor_eval.map.get(v) == Some(&true) {
+                new_kt.fix_tag_at(v, neighbor_eval, env);
             }
         }
         new_kt
